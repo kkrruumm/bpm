@@ -1,0 +1,4 @@
+#!/bin/sh
+# args: <pkg_name> <root>
+[ -x /sbin/ldconfig ] || exit 0
+/sbin/ldconfig -r "$2" 2>/dev/null || :

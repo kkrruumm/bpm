@@ -1,0 +1,300 @@
+#!/bin/sh
+#
+# bpm - basix package manager
+#
+set -eu
+
+BPM_PROGVER=0.2
+
+# where the fuck am i so we can re-exec into the sandbox and into root
+case $0 in
+    */*) _dir=$(cd "${0%/*}" && pwd); BPM_SELF=$_dir/${0##*/} ;;
+    *) BPM_SELF=$(command -v "$0"); _dir=${BPM_SELF%/*} ;;
+esac
+if [ -d "$_dir/lib/style" ]; then : "${BPM_LIBDIR:=$_dir/lib}"; fi
+: "${BPM_LIBDIR:=/usr/lib/bpm}"
+: "${BPM_CONF:=/etc/bpm/bpm.conf}"
+
+# BPM_LIBDIR has to come from the environment because the library is needed here,
+# which is way before bpm.conf is read
+if [ ! -f "$BPM_LIBDIR/common.sh" ]; then
+    printf 'bpm: no library found at %s\n' "$BPM_LIBDIR" >&2
+    printf 'bpm: set BPM_LIBDIR in the environment (bpm.conf is read too late)\n' >&2
+    exit 1
+fi
+
+. "$BPM_LIBDIR/common.sh"
+. "$BPM_LIBDIR/pkg.sh"
+config_load
+
+usage() {
+    cat >&2 <<EOF
+bpm $BPM_PROGVER - basix package manager
+
+usage: bpm <command> [argument ...]
+
+  [b]uild    pkg...   build packages and any missing dependencies
+  [i]nstall  pkg...   build if needed, then install into \$BPM_ROOT
+  [r]emove   pkg...   remove installed packages
+  [u]pdate            pull repositories, rebuild and install what changed
+  [p]ull              clone or pull repositories only
+  [s]earch   pattern  search repositories (globs allowed)
+  [q]uery    pkg      show template metadata and resolved use flags
+  [a]lternatives      list alternatives, or bpm a <pkg> <path> to swap
+  [l]ist     [pkg]    list installed packages
+  [f]iles    pkg      list files owned by an installed package
+  [o]wns     path     show which package owns a path
+  [c]hecksum [-w] pkg print blake3 sums of the dist_files (-w rewrites template)
+  [d]ownload pkg...   fetch dist_files only
+  clean               remove build trees and staged destdirs
+  [h]elp, [v]ersion
+
+config: $BPM_CONF
+repos:  $BPM_REPOS
+EOF
+    exit "${1:-1}"
+}
+
+# builds run in fresh mount, pid, ipc, uts and (unless the template enables
+# network access) network namespaces via unshare
+#
+# unprivileged users also get a user namespace, uid 0 inside is the caller outside
+# so the build can chown to root and write its dest_dir while every file owned by
+# the real root maps to an unmapped uid and stays unwritable
+
+sandbox() {
+    if [ "$BPM_SANDBOX" = 0 ]; then "$@"; return 0; fi
+    have unshare || die "unshare(1) not found; install util-linux or set BPM_SANDBOX=0"
+
+    _u="--mount --pid --fork --ipc --uts --mount-proc"
+    if [ "$(id -u)" != 0 ]; then _u="$_u --user --map-root-user"; fi
+    if [ "${allow_network:-no}" != yes ]; then _u="$_u --net"; fi
+
+    unshare $_u -- "$@" || die "$pkg_name: build failed"
+}
+
+# build shit
+
+build_one() {
+    tmpl_load "$1"
+    if [ -f "$pkg_ar" ] && [ "$BPM_FORCE" = 0 ]; then
+        # the archive records the flags it was built with, so a use flag
+        # change invalidates it just like a version bump does
+        _was=$(ar_member "$pkg_ar" "./var/db/bpm/installed/$pkg_name/use" 2>/dev/null || echo)
+        if [ "$_was" = "$(use_effective)" ]; then
+            sub "$pkg_name-$pkg_ver is already built"
+            return 0
+        fi
+        sub "$pkg_name: use flags changed to \"$(use_effective)\", rebuilding"
+    fi
+    # fetching happens out here because the sandbox probably has no network
+    if have do_fetch; then do_fetch; else src_fetch; fi
+    src_verify
+
+    msg "building $pkg_name-$pkg_ver [$build_style] use: $(use_effective)"
+    sandbox "$BPM_SELF" __build "$pkg_name"
+}
+
+cmd_build() {
+    [ $# -gt 0 ] || usage
+    _order=$(deps_order "$@")
+    msg "build order: $_order"
+    for _p in $_order; do build_one "$_p"; done
+}
+
+cmd_install() {
+    [ $# -gt 0 ] || usage
+    _order=$(deps_order "$@")
+    msg "install order: $_order"
+    for _p in $_order; do build_one "$_p"; done
+
+    _ars=
+    for _p in $_order; do
+        tmpl_load "$_p"
+        pkg_save_old "$_p"
+        _ars="$_ars $pkg_ar"
+    done
+    # shellcheck disable=SC2086
+    as_root "$BPM_SELF" __install $_ars
+}
+
+cmd_remove() {
+    [ $# -gt 0 ] || usage
+    # shellcheck disable=SC2086
+    as_root "$BPM_SELF" __remove "$@"
+}
+
+# repository shit
+
+cmd_pull() {
+    [ -r "$BPM_REPOCONF" ] || die "no repository list at $BPM_REPOCONF"
+    while read -r name url branch; do
+        case $name in ''|\#*) continue ;; esac
+        case $url in /*) continue ;; esac
+        _d=$BPM_REPODIR/$name
+        if [ -d "$_d/.git" ]; then
+            msg "pulling $name"
+            git -C "$_d" pull -q --ff-only
+        else
+            msg "cloning $name from $url"
+            mkdir -p "${_d%/*}"
+            git clone -q ${branch:+--branch "$branch"} "$url" "$_d"
+        fi
+    done < "$BPM_REPOCONF"
+}
+
+cmd_update() {
+    cmd_pull
+    _out=
+    for _d in "$BPM_DB"/*/; do
+        [ -f "$_d/version" ] || continue
+        _p=${_d%/}; _p=${_p##*/}
+        if ! pkg_find "$_p" >/dev/null; then
+            warn "$_p: no longer in any repository"
+            continue
+        fi
+        _oldv=$(cat "$_d/version")
+        _oldu=$(cat "$_d/use" 2>/dev/null || echo)
+        tmpl_load "$_p"
+        if [ "$_oldv" != "$pkg_ver" ] || [ "$_oldu" != "$(use_effective)" ]; then
+            _out="$_out $_p"
+        fi
+    done
+    if [ -z "$_out" ]; then msg "everything is up to date"; return 0; fi
+    msg "to update:$_out"
+    # shellcheck disable=SC2086
+    cmd_install $_out
+}
+
+# query shit
+
+cmd_search() {
+    [ $# -gt 0 ] || usage
+    for _r in $BPM_REPOS; do
+        for _d in "$_r"/*/; do
+            [ -f "$_d/template" ] || continue
+            _n=${_d%/}; _n=${_n##*/}
+            # shellcheck disable=SC2254
+            case $_n in $1|*$1*) printf '%s\t%s\n' "$_n" "$_r" ;; esac
+        done
+    done
+}
+
+cmd_query() {
+    [ $# -gt 0 ] || usage
+    tmpl_load "$1"
+    printf 'pkg_name    %s\nversion     %s\nrevision    %s\nbuild_style %s\n' \
+        "$pkg_name" "$version" "$revision" "$build_style"
+    printf 'short_desc  %s\nhome_page   %s\nlicense     %s\n' \
+        "${short_desc:-}" "${home_page:-}" "${license:-}"
+    printf 'depends     %s\nmakedepends %s\n' "${depends:-}" "${make_depends:-} ${host_make_depends:-}"
+    printf 'use_flags   %s\nuse         %s\n' "${use_flags:-}" "$(use_effective)"
+    printf 'template    %s\n' "$tmpl_dir/template"
+    if pkg_installed "$1"; then printf 'installed   %s\n' "$(cat "$BPM_DB/$1/version")"; fi
+}
+
+cmd_list() {
+    if [ $# -gt 0 ]; then
+        for _p; do
+            pkg_installed "$_p" || die "$_p is not installed"
+            printf '%s %s\n' "$_p" "$(cat "$BPM_DB/$_p/version")"
+        done
+        return 0
+    fi
+    for _d in "$BPM_DB"/*/; do
+        [ -f "$_d/version" ] || continue
+        _p=${_d%/}
+        printf '%s %s\n' "${_p##*/}" "$(cat "$_d/version")"
+    done
+}
+
+cmd_alternatives() {
+    if [ $# -eq 0 ]; then pkg_list_alternatives; return 0; fi
+    [ $# -eq 2 ] || die "usage: bpm alternatives [<pkg> <path>]"
+    as_root "$BPM_SELF" __swap "$1" "$2"
+}
+
+cmd_files() {
+    [ $# -gt 0 ] || usage
+    pkg_installed "$1" || die "$1 is not installed"
+    sort "$BPM_DB/$1/manifest"
+}
+
+cmd_owns() {
+    [ $# -gt 0 ] || usage
+    case $1 in
+        /*) _f=$1 ;;
+        *)  _f=$(cd "$(dirname "$1")" && pwd)/$(basename "$1") ;;
+    esac
+    _o=$(pkg_owner "$_f")
+    [ -n "$_o" ] || die "no package owns $_f"
+    printf '%s\n' "$_o"
+}
+
+cmd_checksum() {
+    _w=0
+    if [ "${1:-}" = -w ]; then _w=1; shift; fi
+    [ $# -gt 0 ] || usage
+    tmpl_load "$1"
+    src_fetch
+    _sums=
+    for _d in ${dist_files:-}; do
+        case $_d in git+*) _sums="$_sums SKIP"; continue ;; esac
+        _sums="$_sums $(blake3 "$src_dir/$(dist_name "$_d")")"
+    done
+    _sums=${_sums# }
+    if [ "$_w" = 1 ]; then
+        sed "s|^checksum=.*|checksum=\"$_sums\"|" "$tmpl_dir/template" > "$tmpl_dir/template.new"
+        mv -f "$tmpl_dir/template.new" "$tmpl_dir/template"
+        msg "checksum updated in $tmpl_dir/template"
+    else
+        printf 'checksum="%s"\n' "$_sums"
+    fi
+}
+
+cmd_download() {
+    [ $# -gt 0 ] || usage
+    for _p; do tmpl_load "$_p"; src_fetch; src_verify; done
+}
+
+cmd_clean() {
+    msg "cleaning build trees"
+    rm -rf "${BPM_CACHE:?}/build" "${BPM_CACHE:?}/dest" "${BPM_CACHE:?}/tmp"
+}
+
+cmd__build() {
+    . "$BPM_LIBDIR/build.sh"
+    build_run "$1"
+}
+
+cmd__install() { for _a; do pkg_install "$_a"; done; }
+cmd__remove() { for _p; do pkg_remove "$_p"; done; }
+cmd__swap() { pkg_swap "$1" "$2"; }
+
+[ $# -gt 0 ] || usage
+cmd=$1
+shift
+
+case $cmd in
+    b|build) cmd_build "$@" ;;
+    i|install) cmd_install "$@" ;;
+    r|remove) cmd_remove "$@" ;;
+    u|update) cmd_update "$@" ;;
+    p|pull) cmd_pull "$@" ;;
+    s|search) cmd_search "$@" ;;
+    q|query) cmd_query "$@" ;;
+    a|alternatives) cmd_alternatives "$@" ;;
+    l|list) cmd_list "$@" ;;
+    f|files) cmd_files "$@" ;;
+    o|owns) cmd_owns "$@" ;;
+    c|checksum) cmd_checksum "$@" ;;
+    d|download) cmd_download "$@" ;;
+    clean) cmd_clean "$@" ;;
+    v|version|--version) printf 'bpm %s\n' "$BPM_PROGVER" ;;
+    h|help|--help) usage 0 ;;
+    __build) cmd__build "$@" ;;
+    __install) cmd__install "$@" ;;
+    __remove) cmd__remove "$@" ;;
+    __swap) cmd__swap "$@" ;;
+    *) die "unknown command: $cmd (try 'bpm help')" ;;
+esac
