@@ -25,6 +25,7 @@ fi
 
 . "$BPM_LIBDIR/common.sh"
 . "$BPM_LIBDIR/pkg.sh"
+. "$BPM_LIBDIR/account.sh"
 config_load
 
 usage() {
@@ -195,6 +196,9 @@ cmd_query() {
         "${short_desc:-}" "${home_page:-}" "${license:-}"
     printf 'depends     %s\nmakedepends %s\n' "${depends:-}" "${make_depends:-} ${host_make_depends:-}"
     printf 'use_flags   %s\nuse         %s\n' "${use_flags:-}" "$(use_effective)"
+    if [ -n "${system_accounts:-}${system_groups:-}" ]; then
+        printf 'accounts    %s\ngroups      %s\n' "${system_accounts:-}" "${system_groups:-}"
+    fi
     printf 'template    %s\n' "$tmpl_dir/template"
     if pkg_installed "$1"; then printf 'installed   %s\n' "$(cat "$BPM_DB/$1/version")"; fi
 }

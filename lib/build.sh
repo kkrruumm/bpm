@@ -118,6 +118,8 @@ write_db() {
     printf '%s\n' "$pkg_ver" > "$_d/version"
     printf '%s\n' "$(use_effective)"  > "$_d/use"
     printf '%s\n' "${depends:-}" > "$_d/depends"
+    acct_records > "$_d/accounts"
+    [ -s "$_d/accounts" ] || rm -f "$_d/accounts"
     manifest_create > "$_d/manifest"
 }
 

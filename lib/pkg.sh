@@ -57,6 +57,10 @@ pkg_install() {
         esac
     done < "$_tmp/new"
 
+    # accounts first, pre-install hooks and the payload itself may refer to them
+    ar_member "$_ar" "./var/db/bpm/installed/$_name/accounts" > "$_tmp/accounts" 2>/dev/null || :
+    accounts_apply "$_tmp/accounts"
+
     hooks pre-install "$_name"
     msg "installing $_name-$_ver"
 
@@ -101,7 +105,7 @@ pkg_install() {
     fi
 
     hooks post-install "$_name"
-    rm -f "$_tmp/new" "$_tmp/foreign" "$_tmp/conflict" "$_tmp/stale"
+    rm -f "$_tmp/new" "$_tmp/foreign" "$_tmp/conflict" "$_tmp/stale" "$_tmp/accounts"
 }
 
 # back up the currently installed manifest before an upgrade overwrites it

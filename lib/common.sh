@@ -202,13 +202,21 @@ TMPL_VARS='pkg_name version revision short_desc maintainer license home_page
  go_import_path go_package go_build_tags go_ldflags go_mod_mode
  dist_files checksum skip_extract wrk_src build_wrk_src create_wrk_src patch_args
  depends make_depends host_make_depends conflicts provides
- use_flags use_default allow_network no_strip keep_libtool'
+ use_flags use_default allow_network no_strip keep_libtool
+ system_accounts system_groups'
 
 TMPL_FUNCS='do_fetch do_extract do_patch do_configure do_build do_check do_install
  pre_configure post_configure pre_build post_build pre_install post_install
  style_extract style_patch style_configure style_build style_check style_install perl_cleanup'
 
 tmpl_clear() {
+    # the per account variables are named after the account, so they can only
+    # be cleared while the list that names them is still around
+    for _a in ${system_accounts:-} ${system_groups:-}; do
+        for _s in uid gid descr homedir shell groups; do
+            unset "${_a}_$_s" 2>/dev/null || :
+        done
+    done
     for _v in $TMPL_VARS; do unset "$_v" 2>/dev/null || :; done
     for _f in $TMPL_FUNCS; do unset -f "$_f" 2>/dev/null || :; done
     USE= tmpl_dir= pkg_ver=
