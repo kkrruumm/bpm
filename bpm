@@ -63,14 +63,18 @@ EOF
 # the real root maps to an unmapped uid and stays unwritable
 
 sandbox() {
-    if [ "$BPM_SANDBOX" = 0 ]; then "$@"; return 0; fi
+    if [ "$BPM_SANDBOX" = 0 ]; then
+        _sb_st=0
+        "$@" || _sb_st=$?
+        return "$_sb_st"
+    fi
     have unshare || die "unshare(1) not found; install util-linux or set BPM_SANDBOX=0"
 
     _u="--mount --pid --fork --ipc --uts --mount-proc"
     if [ "$(id -u)" != 0 ]; then _u="$_u --user --map-root-user"; fi
     if [ "${allow_network:-no}" != yes ]; then _u="$_u --net"; fi
 
-    unshare $_u -- "$@" || die "$pkg_name: build failed"
+    unshare $_u -- "$@"
 }
 
 # build shit
@@ -92,7 +96,9 @@ build_one() {
     src_verify
 
     msg "building $pkg_name-$pkg_ver [$build_style] use: $(use_effective)"
-    sandbox "$BPM_SELF" __build "$pkg_name"
+    _log=$BPM_LOGDIR/$pkg_name.log
+    run_logged "$pkg_name-$pkg_ver" "$_log" sandbox "$BPM_SELF" __build "$pkg_name" ||
+        die "$pkg_name: build failed, full log in $_log"
 }
 
 cmd_build() {
@@ -257,6 +263,20 @@ cmd_download() {
     for _p; do tmpl_load "$_p"; src_fetch; src_verify; done
 }
 
+cmd_log() {
+    if [ $# -eq 0 ]; then
+        for _f in "$BPM_LOGDIR"/*.log; do
+            [ -f "$_f" ] || die "no build logs in $BPM_LOGDIR"
+            _n=${_f##*/}
+            printf '%s\n' "${_n%.log}"
+        done
+        return 0
+    fi
+    _f=$BPM_LOGDIR/$1.log
+    [ -f "$_f" ] || die "no build log for $1 (looked at $_f)"
+    if [ -t 1 ] && [ -n "${PAGER:-}" ]; then "$PAGER" "$_f"; else cat "$_f"; fi
+}
+
 cmd_clean() {
     msg "cleaning build trees"
     rm -rf "${BPM_CACHE:?}/build" "${BPM_CACHE:?}/dest" "${BPM_CACHE:?}/tmp"
@@ -270,6 +290,19 @@ cmd__build() {
 cmd__install() { for _a; do pkg_install "$_a"; done; }
 cmd__remove() { for _p; do pkg_remove "$_p"; done; }
 cmd__swap() { pkg_swap "$1" "$2"; }
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -v|--verbose) BPM_VERBOSE=1 ;;
+        -q|--quiet) BPM_VERBOSE=0 ;;
+        --help|--version) break ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1 (try 'bpm help')" ;;
+        *) break ;;
+    esac
+    shift
+done
+export BPM_VERBOSE
 
 [ $# -gt 0 ] || usage
 cmd=$1
@@ -289,6 +322,7 @@ case $cmd in
     o|owns) cmd_owns "$@" ;;
     c|checksum) cmd_checksum "$@" ;;
     d|download) cmd_download "$@" ;;
+    log) cmd_log "$@" ;;
     clean) cmd_clean "$@" ;;
     v|version|--version) printf 'bpm %s\n' "$BPM_PROGVER" ;;
     h|help|--help) usage 0 ;;

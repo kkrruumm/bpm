@@ -12,6 +12,51 @@ warn() { printf "${CY}=> warning:${CN} %s\n" "$*" >&2; }
 die() { printf "${CR}=> error:${CN} %s\n" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# build output
+# a builds stdout and stderr go to $BPM_LOGDIR/<pkg>.log instead of the
+# terminal, -v (BPM_VERBOSE=1) tees it through as well
+# the log is written either way, so 'bpm log <pkg> can read back a failure
+
+elapsed() {
+    _el=$(( $(date +%s) - $1 ))
+    if [ "$_el" -ge 60 ]; then printf '%dm%02ds' "$((_el / 60))" "$((_el % 60))"
+    else printf '%ds' "$_el"; fi
+}
+
+log_tail() {
+    [ -s "$1" ] || return 0
+    warn "last ${BPM_LOGLINES:-20} lines of $1:"
+    tail -n "${BPM_LOGLINES:-20}" "$1" >&2
+    printf '\n' >&2
+}
+
+# run_logged <label> <logfile> <command>... - returns the commands status
+run_logged() {
+    _rl_label=$1 _rl_log=$2
+    shift 2
+    mkdir -p "${_rl_log%/*}" "$BPM_CACHE/tmp"
+    _rl_start=$(date +%s)
+    _rl_st=0
+
+    if [ "$BPM_VERBOSE" = 0 ]; then
+        "$@" > "$_rl_log" 2>&1 || _rl_st=$?
+    else
+        # status comes back through a file
+        _rl_rc=$BPM_CACHE/tmp/rc.$$
+        rm -f "$_rl_rc"
+        ( set +e; "$@" 2>&1; printf '%s\n' "$?" > "$_rl_rc" ) | tee "$_rl_log"
+        _rl_st=$(cat "$_rl_rc" 2>/dev/null || echo 1)
+        rm -f "$_rl_rc"
+    fi
+
+    if [ "$_rl_st" = 0 ]; then
+        sub "$_rl_label done in $(elapsed "$_rl_start")"
+    elif [ "$BPM_VERBOSE" = 0 ]; then
+        log_tail "$_rl_log"
+    fi
+    return "$_rl_st"
+}
+
 # configuration
 # precedence: environment > config file > built-in defaults
 #
@@ -27,6 +72,7 @@ config_load() {
     : "${BPM_REPOCONF:=/etc/bpm/repos.conf}"
     : "${BPM_USECONF:=/etc/bpm/package.use}"
     : "${BPM_HOOKDIR:=/etc/bpm/hooks}"
+    : "${BPM_LOGDIR:=$BPM_CACHE/logs}"
     : "${BPM_CHO:=var/db/bpm/choices}"
     : "${BPM_JOBS:=$(cpu_count)}"
     : "${BPM_USE:=}"
@@ -35,6 +81,7 @@ config_load() {
     : "${BPM_CHECK:=0}"
     : "${BPM_COMPRESS:=gz}"
     : "${BPM_FORCE:=0}"
+    : "${BPM_VERBOSE:=0}"
     : "${BPM_SU:=$(su_cmd)}"
     : "${CFLAGS:=-O2 -pipe}"
     : "${CXXFLAGS:=$CFLAGS}"
@@ -47,7 +94,7 @@ config_load() {
 
     export BPM_ROOT BPM_CACHE BPM_REPOS BPM_REPODIR BPM_REPOCONF BPM_USECONF \
            BPM_HOOKDIR BPM_CHO BPM_JOBS BPM_USE BPM_SANDBOX BPM_STRIP BPM_CHECK \
-           BPM_COMPRESS BPM_FORCE BPM_CONF BPM_LIBDIR BPM_DB \
+           BPM_COMPRESS BPM_FORCE BPM_CONF BPM_LIBDIR BPM_DB BPM_LOGDIR BPM_VERBOSE \
            CFLAGS CXXFLAGS LDFLAGS
 }
 
