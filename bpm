@@ -47,11 +47,13 @@ usage: bpm <command> [argument ...]
   [o]wns     path     show which package owns a path
   [c]hecksum [-w] pkg print blake3 sums of the dist_files (-w rewrites template)
   [d]ownload pkg...   fetch dist_files only
-  clean               remove build trees and staged destdirs
+  clean [all]         remove build trees and staged destdirs, "all" also
+                      removes the build root base
   [h]elp, [v]ersion
 
 config: $BPM_CONF
 repos:  $BPM_REPOS
+build:  ${BPM_BUILDROOT:-host}
 EOF
     exit "${1:-1}"
 }
@@ -62,6 +64,10 @@ EOF
 # unprivileged users also get a user namespace, uid 0 inside is the caller outside
 # so the build can chown to root and write its dest_dir while every file owned by
 # the real root maps to an unmapped uid and stays unwritable
+#
+# with BPM_BUILDROOT set what lands in here is __stage, which uses the mount
+# namespace to assemble a root of its own and chroots into it, without it the
+# build runs against the hosts / which is IMO unclean
 
 sandbox() {
     if [ "$BPM_SANDBOX" = 0 ]; then
@@ -69,18 +75,65 @@ sandbox() {
         "$@" || _sb_st=$?
         return "$_sb_st"
     fi
-    have unshare || die "unshare(1) not found; install util-linux or set BPM_SANDBOX=0"
+    have unshare || die "unshare(1) not found; install util-linux/busybox or set BPM_SANDBOX=0"
 
     _u="--mount --pid --fork --ipc --uts --mount-proc"
-    if [ "$(id -u)" != 0 ]; then _u="$_u --user --map-root-user"; fi
+    BPM_USERNS=0
+    if [ "$(id -u)" != 0 ]; then
+        _u="$_u --user --map-root-user"
+        BPM_USERNS=1
+    fi
     if [ "${allow_network:-no}" != yes ]; then _u="$_u --net"; fi
+    export BPM_USERNS
 
     unshare $_u -- "$@"
 }
 
 # build shit
 
+# a build root is populated from binary packages, so everything that goes into
+# one has to exist as a binary package first, which shouldn't be an issue because
+# in theory the system bpm is run against was built off of a basix tarball with the
+# base system already built, so missing a base package is a hard error
+broot_require_base() {
+    [ -n "$BPM_BASEPKGS" ] ||
+        die "BPM_BUILDROOT is set but BPM_BASEPKGS is empty, nothing to build in"
+    _miss=
+    # shellcheck disable=SC2086
+    for _bm in $(rdeps_closure $BPM_BASEPKGS); do
+        ar_current "$_bm" || _miss="$_miss $_bm"
+    done
+    [ -z "$_miss" ] || die "no current binary package for build root base:$_miss
+    these have to be built against the host once, e.g.:
+        BPM_BUILDROOT= bpm build$_miss"
+}
+
+# build whatever the build root for <pkg> will need and does not have yet
+broot_prebuild() {
+    case " ${BPM_BUILDING:-} " in
+        *" $1 "*) die "$1: dependency cycle in make_depends" ;;
+    esac
+    BPM_BUILDING="${BPM_BUILDING:-} $1"
+
+    broot_require_base
+    # populating the base needs uid 0 as much as the build does, but it is
+    # shared, so it happens once per run and outside of any packages build log
+    if [ "${BPM_BASE_READY:-0}" = 0 ]; then
+        sandbox "$BPM_SELF" __base || die "failed to populate the build root base"
+        BPM_BASE_READY=1
+    fi
+
+    # shellcheck disable=SC2046
+    for _bd in $(rdeps_closure $(tmpl_get "$1" make_depends host_make_depends)); do
+        ar_current "$_bd" || build_one "$_bd"
+    done
+
+    BPM_BUILDING=${BPM_BUILDING%" $1"}
+}
+
 build_one() {
+    if [ -n "$BPM_BUILDROOT" ]; then broot_prebuild "$1"; fi
+
     tmpl_load "$1"
     if [ -f "$pkg_ar" ] && [ "$BPM_FORCE" = 0 ]; then
         # the archive records the flags it was built with, so a use flag
@@ -98,8 +151,14 @@ build_one() {
 
     msg "building $pkg_name-$pkg_ver [$build_style] use: $(use_effective)"
     _log=$BPM_LOGDIR/$pkg_name.log
-    run_logged "$pkg_name-$pkg_ver" "$_log" sandbox "$BPM_SELF" __build "$pkg_name" ||
-        die "$pkg_name: build failed, full log in $_log"
+    _st=0
+    run_logged "$pkg_name-$pkg_ver" "$_log" sandbox "$BPM_SELF" __stage "$pkg_name" || _st=$?
+
+    # the mounts died with the namespace, this is only the overlay upper layer
+    if [ -n "$BPM_BUILDROOT" ] && [ "$BPM_BROOT_KEEP" = 0 ]; then
+        rm -rf "${BPM_BUILDROOT:?}/$pkg_name"
+    fi
+    [ "$_st" = 0 ] || die "$pkg_name: build failed, full log in $_log"
 }
 
 cmd_build() {
@@ -284,8 +343,38 @@ cmd_log() {
 cmd_clean() {
     msg "cleaning build trees"
     rm -rf "${BPM_CACHE:?}/build" "${BPM_CACHE:?}/dest" "${BPM_CACHE:?}/tmp"
+    if [ -n "$BPM_BUILDROOT" ]; then
+        if [ "${1:-}" = all ]; then
+            msg "removing the build root base"
+            rm -rf "${BPM_BUILDROOT:?}"
+        else
+            for _c in "$BPM_BUILDROOT"/*/; do
+                case ${_c%/} in */base) continue ;; esac
+                [ -d "$_c" ] && rm -rf "$_c" || :
+            done
+        fi
+    fi
 }
 
+# populate the shared build root base, run inside the namespaces so that the
+# unpacked files get the ownership they are supposed to have
+cmd__base() {
+    . "$BPM_LIBDIR/sandbox.sh"
+    mkdir -p "$BPM_BUILDROOT"
+    broot_base
+}
+
+# stage one: inside the namespaces, still on the hosts /
+#
+# assembles the build root and chroots into it, or gets out of the way when
+# build roots are switched off
+cmd__stage() {
+    if [ -z "$BPM_BUILDROOT" ]; then cmd__build "$1"; return "$?"; fi
+    . "$BPM_LIBDIR/sandbox.sh"
+    broot_run "$1"
+}
+
+# stage two: inside the build root
 cmd__build() {
     . "$BPM_LIBDIR/build.sh"
     build_run "$1"
@@ -330,6 +419,8 @@ case $cmd in
     clean) cmd_clean "$@" ;;
     v|version|--version) printf 'bpm %s\n' "$BPM_PROGVER" ;;
     h|help|--help) usage 0 ;;
+    __base) cmd__base "$@" ;;
+    __stage) cmd__stage "$@" ;;
     __build) cmd__build "$@" ;;
     __install) cmd__install "$@" ;;
     __remove) cmd__remove "$@" ;;

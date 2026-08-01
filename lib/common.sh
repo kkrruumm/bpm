@@ -63,7 +63,21 @@ run_logged() {
 # exported variables here win which is what lets bpm re-exec itself
 # with identical settings
 
+# settings where an empty value in the environment is a potentially valid value,
+# BPM_BUILDROOT= means "build against the host", BPM_USE= means "no
+# global flags, leave the templates use_default alone"
+#
+# bpm.conf assigns with :=, which fills in its default over an empty value as
+# readily as over an unset one, so which of these arrived empty has to be
+# remembered before the file is read and applied again after
+BPM_EMPTY_OK='BPM_BUILDROOT BPM_USE'
+
 config_load() {
+    _empty=
+    for _e in $BPM_EMPTY_OK; do
+        eval "if [ -n \"\${$_e+x}\" ] && [ -z \"\$$_e\" ]; then _empty=\"\$_empty $_e\"; fi"
+    done
+
     if [ -r "$BPM_CONF" ]; then . "$BPM_CONF"; fi
 
     : "${BPM_ROOT:=/}"
@@ -77,6 +91,12 @@ config_load() {
     : "${BPM_JOBS:=$(cpu_count)}"
     : "${BPM_USE:=}"
     : "${BPM_SANDBOX:=1}"
+    : "${BPM_BUILDROOT:=}"
+    : "${BPM_BASEPKGS:=}"
+    : "${BPM_BROOT_OVERLAY:=1}"
+    : "${BPM_BROOT_KEEP:=0}"
+    : "${BPM_BROOT_PATH:=/usr/bin:/usr/sbin:/bin:/sbin}"
+    : "${BPM_ENV_KEEP:=http_proxy https_proxy ftp_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY SOURCE_DATE_EPOCH}"
     : "${BPM_STRIP:=1}"
     : "${BPM_CHECK:=0}"
     : "${BPM_COMPRESS:=gz}"
@@ -87,14 +107,25 @@ config_load() {
     : "${CXXFLAGS:=$CFLAGS}"
     : "${LDFLAGS:=-Wl,-O1,--as-needed}"
 
+    for _e in $_empty; do eval "$_e="; done
+
     BPM_ROOT=${BPM_ROOT%/}
+    BPM_BUILDROOT=${BPM_BUILDROOT%/}
     BPM_DB=$BPM_ROOT/var/db/bpm/installed
     : "${BPM_REPOS:=$(repo_list)}"
     [ -n "$BPM_REPOS" ] || die "no repositories: set BPM_REPOS or fill $BPM_REPOCONF"
 
+    # a build root without namespaces to set it up in is not a build root
+    if [ -n "$BPM_BUILDROOT" ] && [ "$BPM_SANDBOX" = 0 ]; then
+        warn "BPM_SANDBOX=0, ignoring BPM_BUILDROOT and building against the host"
+        BPM_BUILDROOT=
+    fi
+
     export BPM_ROOT BPM_CACHE BPM_REPOS BPM_REPODIR BPM_REPOCONF BPM_USECONF \
            BPM_HOOKDIR BPM_CHO BPM_JOBS BPM_USE BPM_SANDBOX BPM_STRIP BPM_CHECK \
            BPM_COMPRESS BPM_FORCE BPM_CONF BPM_LIBDIR BPM_DB BPM_LOGDIR BPM_VERBOSE \
+           BPM_BUILDROOT BPM_BASEPKGS BPM_BROOT_OVERLAY BPM_BROOT_KEEP \
+           BPM_BROOT_PATH BPM_ENV_KEEP \
            CFLAGS CXXFLAGS LDFLAGS
 }
 
@@ -267,6 +298,32 @@ dep_walk() {
 }
 
 pkg_installed() { [ -d "$BPM_DB/$1" ]; }
+
+# runtime closure of the named packages, post-order
+#
+# what the host has installed is irrelevant here: this answers "what has to be
+# unpacked into a build root for these to work", not "what is missing"
+rdeps_closure() {
+    _rseen=' ' _rout=''
+    for _rp in "$@"; do rdep_walk "$_rp"; done
+    printf '%s\n' "${_rout% }"
+}
+
+rdep_walk() {
+    case $_rseen in *" $1 "*) return 0 ;; esac
+    _rseen="$_rseen$1 "
+    for _rd in $(tmpl_get "$1" depends); do rdep_walk "$_rd"; done
+    _rout="$_rout$1 "
+}
+
+# 0 if a binary package exists that matches the templates version, revision and
+# resolved use flags, subshelled so the callers loaded template survives
+ar_current() {
+    ( tmpl_load "$1"
+      [ -f "$pkg_ar" ] || exit 1
+      _ac=$(ar_member "$pkg_ar" "./var/db/bpm/installed/$pkg_name/use" 2>/dev/null || echo)
+      [ "$_ac" = "$(use_effective)" ] )
+}
 
 # filters on stdin/stdout, selected by file extension, so there's not a dependency on
 # tars -a/-J/-z or on any particular tar implementation
