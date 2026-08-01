@@ -68,7 +68,7 @@ apply_patches() {
         done | sort)
     for _p in $_list; do
         sub "patch ${_p##*/}"
-        patch ${patch_args:--Np1} -i "$_p"
+        patch ${patch_args:--p1} -i "$_p"
     done
 }
 
