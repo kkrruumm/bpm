@@ -65,7 +65,7 @@ run_logged() {
 
 # settings where an empty value in the environment is a potentially valid value,
 # BPM_BUILDROOT= means "build against the host", BPM_USE= means "no
-# global flags, leave the templates use_default alone"
+# global flags, leave the templates use_flags alone"
 #
 # bpm.conf assigns with :=, which fills in its default over an empty value as
 # readily as over an unset one, so which of these arrived empty has to be
@@ -181,8 +181,12 @@ pkg_find() {
 # use flags
 #
 # effective flag list, lowest priority first:
-#    use_default (template) -> BPM_USE (global) -> package.use (per package)
+#    use_flags (template) -> BPM_USE (global) -> package.use (per package)
 # later entries win, "-flag" disables, "flag" or "+flag" enables
+#
+# use_flags is a list of flags a package has and also provides the default state of them
+# both package.use and use_flags specify them the same way:
+#    use_flags="man -nls x11"
 
 use_load() {
     USE=$BPM_USE
@@ -198,7 +202,7 @@ use_load() {
 # collide with anything a template or another helper is likely to be using
 use() {
     __ur=1
-    for __uf in ${use_default:-} ${USE:-}; do
+    for __uf in ${use_flags:-} ${USE:-}; do
         case $__uf in
             "$1"|"+$1") __ur=0 ;;
             "-$1") __ur=1 ;;
@@ -218,6 +222,9 @@ use_cmake() { if use "$1"; then printf -- '-D%s=ON' "${2:-$1}"; else printf -- '
 use_effective() {
     __ue=
     for __un in ${use_flags:-}; do
+        __un=${__un#[-+]}
+        # dedup flags
+        case " $__ue " in *" $__un "*|*" -$__un "*) continue ;; esac
         if use "$__un"; then __ue="$__ue $__un"; else __ue="$__ue -$__un"; fi
     done
     printf '%s\n' "${__ue# }"
@@ -233,7 +240,7 @@ TMPL_VARS='pkg_name version revision short_desc maintainer license home_page
  go_import_path go_package go_build_tags go_ldflags go_mod_mode
  dist_files checksum skip_extract wrk_src build_wrk_src create_wrk_src patch_args
  depends make_depends conflicts provides
- use_flags use_default allow_network no_strip keep_libtool
+ use_flags allow_network no_strip keep_libtool
  system_accounts system_groups'
 
 TMPL_FUNCS='do_fetch do_extract do_patch do_configure do_build do_check do_install

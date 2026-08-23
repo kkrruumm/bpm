@@ -1,4 +1,5 @@
 # /etc/bpm/package.use - per package use flags, applied after BPM_USE
+# same format as a package templates use_flags, "flag" enables, "-flag" disables
 #
 #    <pattern>    <flags ...>
 #
@@ -8,7 +9,7 @@
 # later lines add to earlier ones
 #
 # examples:
-#    mpv        x11 wayland pulseaudio -lua
-#    ffmpeg        x264 x265 vpx -nls
-#    *-gtk        x11 wayland
-#    git        -perl doc
+#    mpv    x11 wayland pulseaudio -lua
+#    ffmpeg x264 x265 vpx -nls
+#    *-gtk  x11 wayland
+#    git    -perl doc
