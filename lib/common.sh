@@ -241,7 +241,7 @@ TMPL_VARS='pkg_name version revision short_desc maintainer license home_page
  dist_files checksum skip_extract wrk_src build_wrk_src create_wrk_src patch_args
  depends make_depends conflicts provides
  use_flags allow_network no_strip keep_libtool
- system_accounts system_groups'
+ system_accounts system_groups config_files'
 
 TMPL_FUNCS='do_fetch do_extract do_patch do_configure do_build do_check do_install
  pre_configure post_configure pre_build post_build pre_install post_install

@@ -111,6 +111,32 @@ manifest_create() {
       done ) | sort -r
 }
 
+# b3sum everything the package contains, this gets generated at build time
+# along with the other package metadata
+# the format is <type><class> <sum> <path>
+#    type f = regular file
+#    type l = symlink
+#    class c = configuration
+#    class - = everything else (bins, libs, whatever)
+#    sum = blake3 of the contents or the target of a symlink
+#
+# class c needs to exist for stuff in /etc which may not match because things were modified
+# /var/db/bpm gets skipped ofc
+sums_create() {
+    have b3sum || have rhash || { warn "no blake3 implementation, skipping sums"; return 0; }
+    _cf=" $(printf '%s ' ${config_files:-})"
+    ( cd "$DESTDIR" && find . ! -name . ! -type d | while read -r f; do
+        _p=${f#.}
+        case $_p in /var/db/bpm/*) continue ;; esac
+        case $_p in
+            /etc/*) _c=c ;;
+            *) case $_cf in *" $_p "*) _c=c ;; *) _c=- ;; esac ;; # little golfing never hurt anyone except for my future self
+        esac
+        if [ -h "$f" ]; then printf 'l%s %s  %s\n' "$_c" "$(readlink "$f")" "$_p"
+        else printf 'f%s %s  %s\n' "$_c" "$(blake3 "$f")" "$_p"; fi
+      done )
+}
+
 write_db() {
     _d=$DESTDIR/var/db/bpm/installed/$pkg_name
     mkdir -p "$_d"
@@ -120,6 +146,9 @@ write_db() {
     printf '%s\n' "${depends:-}" > "$_d/depends"
     acct_records > "$_d/accounts"
     [ -s "$_d/accounts" ] || rm -f "$_d/accounts"
+    sums_create > "$_d/sums"
+    [ -s "$_d/sums" ] || rm -f "$_d/sums"
+
     manifest_create > "$_d/manifest"
 }
 

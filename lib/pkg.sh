@@ -12,6 +12,75 @@ ar_ver() { _b=${1##*/}; _b=${_b%.tar.*}; printf '%s\n' "${_b#*@}"; }
 # extract one member to stdout
 ar_member() { decomp "$1" < "$1" | tar xOf - "$2"; }
 
+# the cached archive a package was installed with
+ar_cached() {
+    for _ac in "$BPM_CACHE"/bin/"$1@$2".tar.*; do
+        if [ -f "$_ac" ]; then printf '%s\n' "$_ac"; return 0; fi
+    done
+    return 1
+}
+
+# fingerprint/integrity stuffs
+#
+# every package is built with one checksum per shipped file per line
+# of course, without a blake3 impl there's not really a way to know
+# if something has been modified or not, in the case of this just
+# don't touch anything at all and err on the side of leaving the fs alone
+#
+# the reason i'm being so barbaric with integrity of package files is just
+# because i can, blake3 is fast as fuck so this is probably cheap
+hash_have() { have b3sum || have rhash; }
+
+sum_flags() { printf '%s\n' "${1%% *}"; }
+sum_value() { _sv=${1#* }; printf '%s\n' "${_sv%%  *}"; }
+sum_path()  { _sp=${1#* }; printf '%s\n' "${_sp#*  }"; }
+
+# checksum of a path on disk
+sum_disk() {
+    if [ -h "$1" ]; then readlink "$1"
+    elif [ -f "$1" ] && [ -r "$1" ] && hash_have; then blake3 "$1"
+    else return 1; fi
+}
+
+# output the checksum line for <path> in checksum file $1, this tolerates whitespace in paths
+sums_lookup() {
+    [ -n "$1" ] && [ -f "$1" ] || return 1
+    while IFS= read -r _sl; do # _sl == _steam locomotive
+        if [ "$(sum_path "$_sl")" = "$2" ]; then printf '%s\n' "$_sl"; return 0; fi
+    done < "$1"
+    return 1
+}
+
+# every config path in checksums file $1
+sums_configs() {
+    [ -n "$1" ] && [ -f "$1" ] || return 0
+    while IFS= read -r _sc; do
+        case $(sum_flags "$_sc") in *c) sum_path "$_sc" ;; esac
+    done < "$1"
+}
+
+# this is true when $BPM_ROOT$2 is still what was shipped according to the checksums file $1
+# if there isnt a checksum just conisder the file touched and don't do anything
+sum_pristine() {
+    _sp_l=$(sums_lookup "$1" "$2") || return 1
+    _sp_w=$(sum_value "$_sp_l")
+    _sp_g=$(sum_disk "$BPM_ROOT$2") || return 1
+    case $(sum_flags "$_sp_l") in
+        l*) [ -h "$BPM_ROOT$2" ] || return 1 ;;
+        *) [ ! -h "$BPM_ROOT$2" ] || return 1 ;;
+    esac
+    [ "$_sp_w" = "$_sp_g" ]
+}
+
+# content comparison that doesnt follow symlinks into nowhere
+same_file() {
+    if [ -h "$1" ] || [ -h "$2" ]; then
+        [ -h "$1" ] && [ -h "$2" ] && [ "$(readlink "$1")" = "$(readlink "$2")" ]
+    else
+        cmp -s "$1" "$2"
+    fi
+}
+
 hooks() {
     for _h in "$BPM_HOOKDIR/$1"/*; do
         if [ -x "$_h" ]; then "$_h" "$2" "$BPM_ROOT/" || warn "hook ${_h##*/} failed"; fi
@@ -60,14 +129,53 @@ pkg_install() {
         fi
     fi
 
-    # never overwrite existing configuration, add it as <file>.new instead
+    # /etc/ config handling, for every config that exists already,
+    # identical to what is being shipped = do nothing at all
+    # identical to what was previously shipped = untouched, replace it with the new one
+    # anything else = edited, leave it as is and put the new config file at <file>.new
+    #
+    # the packages checksum lines indicate what files are configs
+    # if a package doesn't have a sum then just keep every /etc file it finds
+    # since its impossible to know if it's been modified or not
+    ar_member "$_ar" "./var/db/bpm/installed/$_name/sums" > "$_tmp/sums" 2>/dev/null || :
+
+    _cand=
+    if [ -s "$_tmp/sums" ]; then
+        sums_configs "$_tmp/sums" > "$_tmp/cfg"
+    else
+        rm -f "$_tmp/sums"
+        grep '^/etc/.*[^/]$' "$_tmp/new" > "$_tmp/cfg" || :
+    fi
+    while IFS= read -r f; do
+        if [ -e "$BPM_ROOT$f" ] || [ -h "$BPM_ROOT$f" ]; then _cand="$_cand $f"; fi
+    done < "$_tmp/cfg"
+
     _keep=
-    while read -r f; do
-        case $f in
-            /etc/*/|/etc/) continue ;;
-            /etc/*) if [ -e "$BPM_ROOT$f" ]; then _keep="$_keep $f"; fi ;;
-        esac
-    done < "$_tmp/new"
+    if [ -n "$_cand" ]; then
+        # staged in a single pass
+        rm -rf "$_tmp/cfgstage"; mkdir -p "$_tmp/cfgstage"
+        set -f
+        set --
+        for f in $_cand; do set -- "$@" ".$f"; done
+        set +f
+        decomp "$_ar" < "$_ar" | tar xf - -C "$_tmp/cfgstage" "$@"
+
+        set -f
+        for f in $_cand; do
+            if [ ! -e "$_tmp/cfgstage$f" ] && [ ! -h "$_tmp/cfgstage$f" ]; then
+                _keep="$_keep $f"; continue
+            fi
+            # already identical to what the new package has 
+            if same_file "$_tmp/cfgstage$f" "$BPM_ROOT$f"; then continue; fi
+            # not edited since it was installed
+            if sum_pristine "$_tmp/oldsums" "$f"; then
+                sub "config unmodified, updating: $f"
+                continue
+            fi
+            _keep="$_keep $f"
+        done
+        set +f
+    fi
 
     # accounts first, pre-install hooks and the payload itself may refer to them
     ar_member "$_ar" "./var/db/bpm/installed/$_name/accounts" > "$_tmp/accounts" 2>/dev/null || :
@@ -109,7 +217,8 @@ pkg_install() {
 
     set -f
     for f in $_keep; do
-        ar_member "$_ar" ".$f" > "$BPM_ROOT$f.new"
+        rm -f "$BPM_ROOT$f.new"
+        cp -Pf "$_tmp/cfgstage$f" "$BPM_ROOT$f.new"
         warn "config preserved: $f (new version in $f.new)"
     done
     set +f
@@ -127,13 +236,18 @@ pkg_install() {
     fi
 
     hooks post-install "$_name"
-    rm -f "$_tmp/new" "$_tmp/foreign" "$_tmp/conflict" "$_tmp/stale" "$_tmp/accounts"
+    rm -rf "$_tmp/cfgstage"
+    rm -f "$_tmp/new" "$_tmp/foreign" "$_tmp/conflict" "$_tmp/stale" \
+          "$_tmp/accounts" "$_tmp/sums" "$_tmp/oldsums" "$_tmp/cfg"
 }
 
-# back up the currently installed manifest before an upgrade overwrites it
+# back up the current manifest and checksum stuff before an upgrade
+# overwrites the db with the one from the new archive
 pkg_save_old() {
     _tmp=$BPM_CACHE/tmp/$1; mkdir -p "$_tmp"
+    rm -f "$_tmp/old" "$_tmp/oldsums"
     if [ -f "$BPM_DB/$1/manifest" ]; then cp "$BPM_DB/$1/manifest" "$_tmp/old"; fi
+    if [ -f "$BPM_DB/$1/sums" ]; then cp "$BPM_DB/$1/sums" "$_tmp/oldsums"; fi
 }
 
 # package removal
@@ -165,6 +279,25 @@ pkg_remove() {
         cp "$BPM_DB/$_name/manifest" "$_tmp/rm"
     fi
 
+    # config is decided one file at a time and everything else just goes
+    # the list gets split immediately instead of testing inside the loop
+    #
+    # the checksum file is read here because the manifest is reverse sorted and
+    # will delete /var/db/bpm before the loop gets to /etc
+    if [ -f "$BPM_DB/$_name/sums" ]; then
+        cp "$BPM_DB/$_name/sums" "$_tmp/sums"
+        sums_configs "$_tmp/sums" > "$_tmp/cfg"
+    else
+        rm -f "$_tmp/sums"
+        grep '^/etc/.*[^/]$' "$_tmp/rm" > "$_tmp/cfg" || :
+    fi
+    if [ -s "$_tmp/cfg" ]; then
+        grep -Fxf "$_tmp/cfg" "$_tmp/rm" > "$_tmp/rmcfg" || :
+        grep -vxFf "$_tmp/cfg" "$_tmp/rm" > "$_tmp/rmrest" || :
+    else
+        : > "$_tmp/rmcfg"; cp "$_tmp/rm" "$_tmp/rmrest"
+    fi
+
     hooks pre-remove "$_name"
     msg "removing $_name"
 
@@ -173,13 +306,27 @@ pkg_remove() {
     else warn "$_name: could not stage rm/rmdir, removal may not finish"
     fi
 
+    # config first, it goes with the package unless it was edited, see comments a bit higher up
+    #
+    # doing this before the rest means that dirs that had a deleted config still get cleaned up
+    # a .new left over from an update is always gotten rid of, it's the default of a package that
+    # doesn't exist anymore
+    while IFS= read -r f; do
+        rm -f "$BPM_ROOT$f.new"
+        if sum_pristine "$_tmp/sums" "$f"; then
+            rm -f "$BPM_ROOT$f"
+        elif [ -e "$BPM_ROOT$f" ] || [ -h "$BPM_ROOT$f" ]; then
+            warn "config kept: $f"
+        fi
+    done < "$_tmp/rmcfg"
+
     # the manifest is reverse sorted so files precede the directories holding them
     while read -r f; do
         case $f in
             */) rmdir "$BPM_ROOT$f" 2>/dev/null || : ;;
             *) rm -f "$BPM_ROOT$f" ;;
         esac
-    done < "$_tmp/rm"
+    done < "$_tmp/rmrest"
     rm -rf "${BPM_DB:?}/$_name" "$_tmp"
 
     # hooks keep the staged tools becuase they're likely to need a util
@@ -188,6 +335,90 @@ pkg_remove() {
     hooks post-remove "$_name"
     rm -rf "$BPM_CACHE/tmp/.tools" 2>/dev/null || :
     PATH=$_oldpath
+}
+
+# verification
+#
+# where a packaged path is actually at, if it lost a conflict at install time
+# the real file in the choices db and the packaged path belongs to whoever won
+# see alternatives below
+pkg_location() {
+    if [ -e "$BPM_ROOT$2" ] || [ -h "$BPM_ROOT$2" ]; then printf '%s\n' "$2"; return 0; fi
+    _pl=/$BPM_CHO/$(cho_name "$1" "$2")
+    if [ -e "$BPM_ROOT$_pl" ] || [ -h "$BPM_ROOT$_pl" ]; then printf '%s\n' "$_pl"; return 0; fi
+    printf '%s\n' "$2"
+}
+
+# check a package against its recorded checksums
+# this prints <pkg> <path> <reason> per mismatch,
+# config files get skipped unless BPM_VERIFY_CONFIG is set to 1
+pkg_verify() {
+    _name=$1
+    _vs=$BPM_DB/$_name/sums
+    if [ ! -f "$_vs" ]; then
+        BPM_VERIFY_NOSUMS=$((BPM_VERIFY_NOSUMS + 1))
+        return 0
+    fi
+    hash_have || die "no blake3 implementation found (install b3sum)"
+
+    _vst=0
+    while IFS= read -r _vl; do
+        [ -n "$_vl" ] || continue
+        _vf=$(sum_flags "$_vl"); _vw=$(sum_value "$_vl"); _vp=$(sum_path "$_vl")
+        case $_vf in *c) [ "$BPM_VERIFY_CONFIG" = 1 ] || continue ;; esac
+        _vl_at=$(pkg_location "$_name" "$_vp")
+        _vr=
+        if [ ! -e "$BPM_ROOT$_vl_at" ] && [ ! -h "$BPM_ROOT$_vl_at" ]; then
+            _vr=missing
+        elif [ -h "$BPM_ROOT$_vl_at" ]; then
+            case $_vf in
+                l*) [ "$(readlink "$BPM_ROOT$_vl_at")" = "$_vw" ] || _vr=changed ;;
+                *) _vr=type ;;
+            esac
+        else
+            case $_vf in
+                l*) _vr=type ;;
+                *) if [ ! -r "$BPM_ROOT$_vl_at" ]; then _vr=unreadable
+                   elif [ "$(blake3 "$BPM_ROOT$_vl_at")" != "$_vw" ]; then _vr=changed
+                   fi ;;
+            esac
+        fi
+        if [ -n "$_vr" ]; then
+            printf '%s %s %s\n' "$_name" "$_vp" "$_vr"
+            _vst=1
+        fi
+    done < "$_vs"
+    return "$_vst"
+}
+
+# put a file back from the original package
+pkg_restore() {
+    _name=$1 _path=$2
+    pkg_installed "$_name" || die "$_name is not installed"
+    _rv=$(cat "$BPM_DB/$_name/version")
+    _ra=$(ar_cached "$_name" "$_rv") ||
+        die "$_name: no cached archive for $_rv in $BPM_CACHE/bin, rebuild it first"
+
+    _rt=$BPM_CACHE/tmp/$_name.restore
+    rm -rf "$_rt"; mkdir -p "$_rt"
+    decomp "$_ra" < "$_ra" | tar xf - -C "$_rt" ".$_path" 2>/dev/null ||
+        die "$_name: $_path is not in $_ra"
+    [ -e "$_rt$_path" ] || [ -h "$_rt$_path" ] ||
+        die "$_name: $_path is not in $_ra"
+
+    # a path this package lost to an alternative is repaired in the choices db,
+    # not moved out of it
+    _rl=$(pkg_location "$_name" "$_path")
+    mkdir -p "$BPM_ROOT${_rl%/*}"
+
+    # staged beside the target and renamed into place because $_path might be
+    # something this is running with
+    _rs=$BPM_ROOT$_rl.bpm-new
+    rm -f "$_rs"
+    cp -Pp "$_rt$_path" "$_rs" || { rm -f "$_rs"; die "$_name: could not stage $_rl"; }
+    mv -f "$_rs" "$BPM_ROOT$_rl"
+    rm -rf "$_rt"
+    msg "restored $_rl from $_name-$_rv"
 }
 
 # queries

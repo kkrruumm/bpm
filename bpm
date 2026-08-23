@@ -42,6 +42,9 @@ usage: bpm <command> [argument ...]
   [s]earch   pattern  search repositories (globs allowed)
   [q]uery    pkg      show template metadata and resolved use flags
   [a]lternatives      list alternatives, or bpm a <pkg> <path> to swap
+  verify     [pkg...] list files that no longer match what was packaged,
+                      -c includes config files, --overwrite <pkg> <path>
+                      restores the specified file from the archive
   [l]ist     [pkg]    list installed packages
   [f]iles    pkg      list files owned by an installed package
   [o]wns     path     show which package owns a path
@@ -303,6 +306,51 @@ cmd_alternatives() {
     as_root "$BPM_SELF" __swap "$1" "$2"
 }
 
+# pretty much same usage style as alternatives
+# in theory this should be a good way to restore
+# broken/corrupted shit from packages if they still
+# exist in the package archive, this is not useful for
+# detecting tampering or anything though (nongoal)
+cmd_verify() {
+    _ow=0
+    BPM_VERIFY_CONFIG=0
+    BPM_VERIFY_NOSUMS=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -c|--config) BPM_VERIFY_CONFIG=1 ;;
+            -o|--overwrite) _ow=1 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1 (try 'bpm help')" ;;
+            *) break ;;
+        esac
+        shift
+    done
+
+    if [ "$_ow" = 1 ]; then
+        [ $# -eq 2 ] || die "usage: bpm verify --overwrite <pkg> <path>"
+        as_root "$BPM_SELF" __restore "$1" "$2"
+        return 0
+    fi
+
+    if [ $# -eq 0 ]; then
+        for _d in "$BPM_DB"/*/; do
+            [ -f "$_d/version" ] || continue
+            _d=${_d%/}
+            set -- "$@" "${_d##*/}"
+        done
+    else
+        for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+    fi
+
+    _st=0
+    for _p; do pkg_verify "$_p" || _st=1; done
+    if [ "$BPM_VERIFY_NOSUMS" -gt 0 ]; then
+        warn "$BPM_VERIFY_NOSUMS package(s) predate sums and were not checked"
+    fi
+    if [ "$_st" = 0 ]; then msg "no mismatches"; fi
+    return "$_st"
+}
+
 cmd_files() {
     [ $# -gt 0 ] || usage
     pkg_installed "$1" || die "$1 is not installed"
@@ -403,6 +451,7 @@ cmd__build() {
 cmd__install() { for _a; do pkg_install "$_a"; done; }
 cmd__remove() { for _p; do pkg_remove "$_p"; done; }
 cmd__swap() { pkg_swap "$1" "$2"; }
+cmd__restore() { pkg_restore "$1" "$2"; }
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -435,6 +484,7 @@ case $cmd in
     o|owns) cmd_owns "$@" ;;
     c|checksum) cmd_checksum "$@" ;;
     d|download) cmd_download "$@" ;;
+    verify) cmd_verify "$@" ;;
     log) cmd_log "$@" ;;
     clean) cmd_clean "$@" ;;
     v|version|--version) printf 'bpm %s\n' "$BPM_PROGVER" ;;
@@ -445,5 +495,6 @@ case $cmd in
     __install) cmd__install "$@" ;;
     __remove) cmd__remove "$@" ;;
     __swap) cmd__swap "$@" ;;
+    __restore) cmd__restore "$@" ;;
     *) die "unknown command: $cmd (try 'bpm help')" ;;
 esac
