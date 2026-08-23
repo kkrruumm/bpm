@@ -124,7 +124,7 @@ broot_prebuild() {
     fi
 
     # shellcheck disable=SC2046
-    for _bd in $(rdeps_closure $(tmpl_get "$1" make_depends host_make_depends)); do
+    for _bd in $(rdeps_closure $(tmpl_get "$1" make_depends)); do
         ar_current "$_bd" || build_one "$_bd"
     done
 
@@ -138,7 +138,7 @@ broot_prebuild() {
 host_require_makedeps() {
     _miss=
     # shellcheck disable=SC2046
-    for _hd in $(rdeps_closure $(tmpl_get "$1" make_depends host_make_depends)); do
+    for _hd in $(rdeps_closure $(tmpl_get "$1" make_depends)); do
         pkg_installed "$_hd" || _miss="$_miss $_hd"
     done
     [ -z "$_miss" ] || die "$1: BPM_BUILDROOT is unset and makedepends are missing:$_miss
@@ -273,7 +273,7 @@ cmd_query() {
         "$pkg_name" "$version" "$revision" "$build_style"
     printf 'short_desc  %s\nhome_page   %s\nlicense     %s\n' \
         "${short_desc:-}" "${home_page:-}" "${license:-}"
-    printf 'depends     %s\nmakedepends %s\n' "${depends:-}" "${make_depends:-} ${host_make_depends:-}"
+    printf 'depends     %s\nmakedepends %s\n' "${depends:-}" "${make_depends:-}"
     printf 'use_flags   %s\nuse         %s\n' "${use_flags:-}" "$(use_effective)"
     if [ -n "${system_accounts:-}${system_groups:-}" ]; then
         printf 'accounts    %s\ngroups      %s\n' "${system_accounts:-}" "${system_groups:-}"

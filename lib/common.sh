@@ -232,7 +232,7 @@ TMPL_VARS='pkg_name version revision short_desc maintainer license home_page
  cargo_args cargo_install_path gem_spec stackage
  go_import_path go_package go_build_tags go_ldflags go_mod_mode
  dist_files checksum skip_extract wrk_src build_wrk_src create_wrk_src patch_args
- depends make_depends host_make_depends conflicts provides
+ depends make_depends conflicts provides
  use_flags use_default allow_network no_strip keep_libtool
  system_accounts system_groups'
 

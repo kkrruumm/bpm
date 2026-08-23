@@ -12,9 +12,9 @@
 #    <pkg>/up      overlay upper layer, thrown away after every build
 #    <pkg>/work    overlay work directory
 #
-# only make_depends and host_make_depends (plus their runtime closure) are
-# unpacked into the root, so a template that fails to declare something will
-# fail to build instead of silently picking it up off of the host
+# only make_depends (plus their runtime closure) are unpacked into the root, so
+# a template that fails to declare something will fail to build instead of
+# silently picking it up off of the host
 
 # unpack a binary package into a root
 # no hooks, no alternatives, no configuration preservation, the root is
@@ -159,11 +159,11 @@ broot_mounts() {
     fi
 }
 
-# make_depends and host_make_depends of <pkg> plus everything those need at
-# runtime, this is the entire contents of the build root on top of the base
+# make_depends of <pkg> plus everything those need at runtime, this is the
+# entire contents of the build root on top of the base
 broot_deps() {
     # shellcheck disable=SC2046
-    rdeps_closure $(tmpl_get "$1" make_depends host_make_depends)
+    rdeps_closure $(tmpl_get "$1" make_depends)
 }
 
 # the build root is hermetic on the filesystem, this makes it hermetic on the
