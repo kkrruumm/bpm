@@ -281,7 +281,8 @@ tmpl_get() {
 #
 # post-order walk: dependencies are emitted before their dependants
 # already installed dependencies are not revisited while explicitly named packages always are
-
+#
+# make_depends is intentionally not walked here
 deps_order() {
     _seen=' ' _order=''
     for _p; do dep_walk "$_p"; done
@@ -291,7 +292,7 @@ deps_order() {
 dep_walk() {
     case $_seen in *" $1 "*) return 0 ;; esac
     _seen="$_seen$1 "
-    for _d in $(tmpl_get "$1" depends make_depends host_make_depends); do
+    for _d in $(tmpl_get "$1" depends); do
         if ! pkg_installed "$_d"; then dep_walk "$_d"; fi
     done
     _order="$_order$1 "

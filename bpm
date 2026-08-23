@@ -131,8 +131,28 @@ broot_prebuild() {
     BPM_BUILDING=${BPM_BUILDING%" $1"}
 }
 
+# if theres not a defined buildroot the build will be running on the hosts /
+# so the makedepends *have* to be installed on the host but
+# require interaction for this so this isnt a hidden installation of
+# build only dependencies
+host_require_makedeps() {
+    _miss=
+    # shellcheck disable=SC2046
+    for _hd in $(rdeps_closure $(tmpl_get "$1" make_depends host_make_depends)); do
+        pkg_installed "$_hd" || _miss="$_miss $_hd"
+    done
+    [ -z "$_miss" ] || die "$1: BPM_BUILDROOT is unset and makedepends are missing:$_miss
+    set BPM_BUILDROOT in $BPM_CONF so they can be built into a throwaway root
+    or put them on the host intentionally with:
+        bpm install$_miss"
+}
+
 build_one() {
-    if [ -n "$BPM_BUILDROOT" ]; then broot_prebuild "$1"; fi
+    if [ -n "$BPM_BUILDROOT" ]; then
+        broot_prebuild "$1"
+    else
+        host_require_makedeps "$1"
+    fi
 
     tmpl_load "$1"
     if [ -f "$pkg_ar" ] && [ "$BPM_FORCE" = 0 ]; then
