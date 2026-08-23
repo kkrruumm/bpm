@@ -138,6 +138,20 @@ pkg_save_old() {
 
 # package removal
 
+# rm and rmdir get ran once per manifest line so removing hte package that
+# owns them deletes halfway down the list and every remaining file gets left on the disk
+tools_stage() {
+    _tsdir=$BPM_CACHE/tmp/.tools
+    rm -rf "$_tsdir" || return 1
+    mkdir -p "$_tsdir" || return 1
+    for _t in rm rmdir; do
+        _tp=$(command -v "$_t") || return 1
+        [ -n "$_tp" ] || return 1
+        cp -f "$_tp" "$_tsdir/$_t" || return 1
+        chmod 755 "$_tsdir/$_t" || return 1
+    done
+}
+
 pkg_remove() {
     _name=$1
     pkg_installed "$_name" || die "$_name is not installed"
@@ -153,6 +167,12 @@ pkg_remove() {
 
     hooks pre-remove "$_name"
     msg "removing $_name"
+
+    _oldpath=$PATH
+    if tools_stage; then PATH=$_tsdir:$PATH
+    else warn "$_name: could not stage rm/rmdir, removal may not finish"
+    fi
+
     # the manifest is reverse sorted so files precede the directories holding them
     while read -r f; do
         case $f in
@@ -161,7 +181,13 @@ pkg_remove() {
         esac
     done < "$_tmp/rm"
     rm -rf "${BPM_DB:?}/$_name" "$_tmp"
+
+    # hooks keep the staged tools becuase they're likely to need a util
+    # the package being removed used to provide
+    # the staged rm should be able to delete the directory it lives in
     hooks post-remove "$_name"
+    rm -rf "$BPM_CACHE/tmp/.tools" 2>/dev/null || :
+    PATH=$_oldpath
 }
 
 # queries
@@ -197,24 +223,42 @@ pkg_swap() {
     [ -e "$BPM_ROOT/$BPM_CHO/$_c" ] || [ -h "$BPM_ROOT/$BPM_CHO/$_c" ] ||
         die "no alternative '$1 $2'"
 
+    # #2 might be one of the things this function runs, /usr/bin/mv being the main one
+    # due to this, stage the transaction, this should be atomic
+    _own= _oc=
     if [ -e "$BPM_ROOT$2" ] || [ -h "$BPM_ROOT$2" ]; then
         _own=$(pkg_owner "$2" | head -n1)
         [ -n "$_own" ] || die "$2 exists but no package owns it"
-        msg "swapping $2 from $_own to $1"
-
         _oc=$(cho_name "$_own" "$2")
-        _m=$BPM_DB/$_own/manifest
-        manifest_repoint "$_m" "$2" "/$BPM_CHO/$_oc" > "$_m.t" ||
-            die "$_own: $2 missing from manifest, refusing to demote it"
-        mv -f "$BPM_ROOT$2" "$BPM_ROOT/$BPM_CHO/$_oc"
-        mv -f "$_m.t" "$_m"
-        sort -r "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
     fi
 
-    _m=$BPM_DB/$1/manifest
-    manifest_repoint "$_m" "/$BPM_CHO/$_c" "$2" > "$_m.t" ||
+    # both manifests are written to temps before anything on disk gets touched
+    _mn=$BPM_DB/$1/manifest
+    manifest_repoint "$_mn" "/$BPM_CHO/$_c" "$2" > "$_mn.t" ||
         die "$1: /$BPM_CHO/$_c missing from manifest, refusing to promote it"
-    mv -f "$BPM_ROOT/$BPM_CHO/$_c" "$BPM_ROOT$2"
-    mv -f "$_m.t" "$_m"
-    sort -r "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
+    if [ -n "$_own" ]; then
+        _mo=$BPM_DB/$_own/manifest
+        manifest_repoint "$_mo" "$2" "/$BPM_CHO/$_oc" > "$_mo.t" ||
+            die "$_own: $2 missing from manifest, refusing to demote it"
+    fi
+
+    _stage=$BPM_ROOT$2.bpm-new
+    rm -f "$_stage"
+    cp -a "$BPM_ROOT/$BPM_CHO/$_c" "$_stage" || die "$1: could not stage $2"
+    if [ -n "$_own" ]; then
+        msg "swapping $2 from $_own to $1"
+        cp -a "$BPM_ROOT$2" "$BPM_ROOT/$BPM_CHO/$_oc" ||
+            { rm -f "$_stage"; die "$_own: could not stash $2"; }
+    fi
+
+    # the only step that touches the live path, a rename within one directory
+    mv -f "$_stage" "$BPM_ROOT$2"
+    rm -f "$BPM_ROOT/$BPM_CHO/$_c"
+
+    mv -f "$_mn.t" "$_mn"
+    sort -r "$_mn" > "$_mn.t" && mv -f "$_mn.t" "$_mn"
+    if [ -n "$_own" ]; then
+        mv -f "$_mo.t" "$_mo"
+        sort -r "$_mo" > "$_mo.t" && mv -f "$_mo.t" "$_mo"
+    fi
 }
