@@ -18,6 +18,18 @@ hooks() {
     done
 }
 
+# replace the literal exact line $2 with $3, this needs to happen due to things like
+# /usr/bin/[ fucking up regex
+manifest_repoint() {
+    _mr_hit=
+    while IFS= read -r _mr_l; do
+        if [ "$_mr_l" = "$2" ]; then _mr_hit=1; printf '%s\n' "$3"
+        else printf '%s\n' "$_mr_l"
+        fi
+    done < "$1"
+    [ -n "$_mr_hit" ]
+}
+
 # every path owned by an installed package other than $1
 foreign_files() {
     for _m in "$BPM_DB"/*/manifest; do
@@ -64,33 +76,43 @@ pkg_install() {
     hooks pre-install "$_name"
     msg "installing $_name-$_ver"
 
+    set -f
     set --
     for f in $_keep; do set -- "$@" "--exclude=.$f"; done
     for f in $_chos; do set -- "$@" "--exclude=.$f"; done
+    set +f
     decomp "$_ar" < "$_ar" | tar xf - -C "${BPM_ROOT:-}/" "$@"
 
     # pull the conflicting files out into the choices store and repoint this
     # packages manifest at them, tar rather than ar_member so modes survive
     if [ -n "$_chos" ]; then
         rm -rf "$_tmp/cho"; mkdir -p "$_tmp/cho" "$BPM_ROOT/$BPM_CHO"
+        set -f
         set --
         for f in $_chos; do set -- "$@" ".$f"; done
+        set +f
         decomp "$_ar" < "$_ar" | tar xf - -C "$_tmp/cho" "$@"
 
         _m=$BPM_DB/$_name/manifest
+        set -f
         for f in $_chos; do
             _c=$(cho_name "$_name" "$f")
+            manifest_repoint "$_m" "$f" "/$BPM_CHO/$_c" > "$_m.t" ||
+                die "$_name: $f missing from manifest, refusing to stash it"
             mv -f "$_tmp/cho$f" "$BPM_ROOT/$BPM_CHO/$_c"
-            sed "s|^$f\$|/$BPM_CHO/$_c|" "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
+            mv -f "$_m.t" "$_m"
         done
+        set +f
         sort -r "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
         rm -rf "$_tmp/cho"
     fi
 
+    set -f
     for f in $_keep; do
         ar_member "$_ar" ".$f" > "$BPM_ROOT$f.new"
         warn "config preserved: $f (new version in $f.new)"
     done
+    set +f
 
     # on upgrade drop files the new version no longer ships
     if [ -f "$_tmp/old" ]; then
@@ -181,14 +203,18 @@ pkg_swap() {
         msg "swapping $2 from $_own to $1"
 
         _oc=$(cho_name "$_own" "$2")
-        mv -f "$BPM_ROOT$2" "$BPM_ROOT/$BPM_CHO/$_oc"
         _m=$BPM_DB/$_own/manifest
-        sed "s|^$2\$|/$BPM_CHO/$_oc|" "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
+        manifest_repoint "$_m" "$2" "/$BPM_CHO/$_oc" > "$_m.t" ||
+            die "$_own: $2 missing from manifest, refusing to demote it"
+        mv -f "$BPM_ROOT$2" "$BPM_ROOT/$BPM_CHO/$_oc"
+        mv -f "$_m.t" "$_m"
         sort -r "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
     fi
 
-    mv -f "$BPM_ROOT/$BPM_CHO/$_c" "$BPM_ROOT$2"
     _m=$BPM_DB/$1/manifest
-    sed "s|^/$BPM_CHO/$_c\$|$2|" "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
+    manifest_repoint "$_m" "/$BPM_CHO/$_c" "$2" > "$_m.t" ||
+        die "$1: /$BPM_CHO/$_c missing from manifest, refusing to promote it"
+    mv -f "$BPM_ROOT/$BPM_CHO/$_c" "$BPM_ROOT$2"
+    mv -f "$_m.t" "$_m"
     sort -r "$_m" > "$_m.t" && mv -f "$_m.t" "$_m"
 }
