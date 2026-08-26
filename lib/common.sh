@@ -106,6 +106,10 @@ config_load() {
     : "${CFLAGS:=-O2 -pipe}"
     : "${CXXFLAGS:=$CFLAGS}"
     : "${LDFLAGS:=-Wl,-O1,--as-needed}"
+    : "${RUSTFLAGS:=-C opt-level=2 -C link-arg=$LDFLAGS}"
+    : "${GOFLAGS:=-trimpath}"
+    : "${CGO_ENABLED:=1}"
+    : "${ZIGFLAGS:=-Doptimize=ReleaseSafe}"
 
     for _e in $_empty; do eval "$_e="; done
 
@@ -126,7 +130,7 @@ config_load() {
            BPM_COMPRESS BPM_FORCE BPM_CONF BPM_LIBDIR BPM_DB BPM_LOGDIR BPM_VERBOSE \
            BPM_BUILDROOT BPM_BASEPKGS BPM_BROOT_OVERLAY BPM_BROOT_KEEP \
            BPM_BROOT_PATH BPM_ENV_KEEP \
-           CFLAGS CXXFLAGS LDFLAGS
+           CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS GOFLAGS CGO_ENABLED ZIGFLAGS GOAMD64
 }
 
 cpu_count() {

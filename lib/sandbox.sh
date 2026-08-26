@@ -205,7 +205,7 @@ broot_run() {
     # names come from env(1)values from the shell, so values containing
     # whitespace or anything else exciting survive
     for _bv in $(env | sed -n 's/^\(BPM_[A-Za-z0-9_]*\)=.*/\1/p') \
-               CFLAGS CXXFLAGS LDFLAGS ${BPM_ENV_KEEP:-}; do
+               CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS GOFLAGS GOAMD64 CGO_ENABLED ZIGFLAGS ${BPM_ENV_KEEP:-}; do
         eval "[ -n \"\${$_bv+x}\" ]" || continue
         eval "set -- \"\$@\" \"$_bv=\${$_bv}\""
     done
