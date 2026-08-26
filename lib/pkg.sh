@@ -337,6 +337,152 @@ pkg_remove() {
     PATH=$_oldpath
 }
 
+# install reason
+#
+# a package can be explicit or auto, explicit means it was requested
+# and auto means it was pulled as a dependency
+#
+# this gets written after a package is extracted and doesn't show up in a manifest
+# anything that doesn't have this file (old installs or something ig) just falls
+# back to explicit
+#
+# if a user wants to mark a package as explicit, they can just explicitly install it
+
+pkg_reason() {
+    if [ -f "$BPM_DB/$1/reason" ]; then
+        read -r _pr < "$BPM_DB/$1/reason" || _pr=
+        case $_pr in auto|explicit) printf '%s\n' "$_pr"; return 0 ;; esac
+    fi
+    printf 'explicit\n'
+}
+
+pkg_mark() {
+    case $1 in
+        auto|explicit) ;;
+        *) die "unknown install reason: $1 (auto or explicit)" ;;
+    esac
+    pkg_installed "$2" || die "$2 is not installed"
+    printf '%s\n' "$1" > "$BPM_DB/$2/reason"
+}
+
+# what pkg_install puts in the db once the package has been extracted
+#    explicit - user explicitly installed this
+#    auto - pulled as a dep, never demotes a package that was
+#           already explicitly installed
+#    keep - an upgrade, leave whatever is already recorded alone
+pkg_mark_installed() {
+    case $2 in
+        explicit) pkg_mark explicit "$1" ;;
+        auto|keep)
+            if [ ! -f "$BPM_DB/$1/reason" ] && [ "$2" = auto ]; then
+                pkg_mark auto "$1"
+            fi ;;
+        *) die "unknown install reason: $2" ;;
+    esac
+}
+
+# orphans
+#
+# the runtime dependencies as they were recorded when <pkg> was installed
+# package template is read as a fallback
+pkg_depends() {
+    if [ -f "$BPM_DB/$1/depends" ]; then
+        cat "$BPM_DB/$1/depends"
+    elif pkg_find "$1" >/dev/null 2>&1; then
+        tmpl_get "$1" depends 2>/dev/null || :
+    fi
+}
+
+# 0 when installed package $1 depends on $2
+dep_has() {
+    for _dh in $(pkg_depends "$1"); do
+        if [ "$_dh" = "$2" ]; then return 0; fi
+    done
+    return 1
+}
+
+# every installed package
+pkg_all() {
+    for _pa in "$BPM_DB"/*/; do
+        [ -f "$_pa/version" ] || continue
+        _pa=${_pa%/}
+        printf '%s\n' "${_pa##*/}"
+    done
+}
+
+# packages the caller pretends are already removed so "what would this orphan"
+# and "what is already orphaned" are the same walk
+pkg_omitted() {
+    case " ${BPM_OMIT:-} " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# installed packages that still depend on $1
+pkg_rdeps() {
+    for _rd in $(pkg_all); do
+        if [ "$_rd" = "$1" ]; then continue; fi
+        if pkg_omitted "$_rd"; then continue; fi
+        if dep_has "$_rd" "$1"; then printf '%s\n' "$_rd"; fi
+    done
+}
+
+# mark packages that are on the system in their own right
+# anything explicitly installed, anything BPM_KEEP matches, and the buildroot base
+keep_walk() {
+    case $BPM_KEPT in *" $1 "*) return 0 ;; esac
+    pkg_installed "$1" || return 0
+    if pkg_omitted "$1"; then return 0; fi
+    BPM_KEPT="$BPM_KEPT$1 "
+    for _kw in $(pkg_depends "$1"); do keep_walk "$_kw"; done
+}
+
+# pkg_orphans [pkg...] - the arguments are treated as already removed
+pkg_orphans() {
+    BPM_OMIT=$*
+    BPM_KEPT=' '
+    _oall=$(pkg_all)
+
+    for _op in $_oall; do
+        if pkg_omitted "$_op"; then continue; fi
+        case $(pkg_reason "$_op") in explicit) keep_walk "$_op" ;; esac
+    done
+
+    # globs so "linux*" or "grub" in BPM_KEEP both work
+    for _ok in $BPM_KEEP $BPM_BASEPKGS; do
+        for _op in $_oall; do
+            # shellcheck disable=SC2254
+            case $_op in $_ok) keep_walk "$_op" ;; esac
+        done
+    done
+
+    for _op in $_oall; do
+        if pkg_omitted "$_op"; then continue; fi
+        case $BPM_KEPT in *" $_op "*) ;; *) printf '%s\n' "$_op" ;; esac
+    done
+    BPM_OMIT=
+}
+
+# dependants are removed before the things they depend on
+# which is the reverse of what order they got installed in
+#
+# post order walk, then reverse, dependencies outside the set are ignored
+remove_order() {
+    BPM_RSET=" $* " BPM_RSEEN=' ' BPM_RORD=''
+    for _ro; do remove_walk "$_ro"; done
+    _rrev=
+    for _ro in $BPM_RORD; do _rrev="$_ro $_rrev"; done
+    printf '%s\n' "${_rrev% }"
+}
+
+remove_walk() {
+    case $BPM_RSEEN in *" $1 "*) return 0 ;; esac
+    BPM_RSEEN="$BPM_RSEEN$1 "
+    for _rw in $(pkg_depends "$1"); do
+        case $BPM_RSET in *" $_rw "*) remove_walk "$_rw" ;; esac
+    done
+    BPM_RORD="$BPM_RORD$1 "
+}
+
 # verification
 #
 # where a packaged path is actually at, if it lost a conflict at install time

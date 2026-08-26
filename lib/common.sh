@@ -97,6 +97,8 @@ config_load() {
     : "${BPM_BROOT_KEEP:=0}"
     : "${BPM_BROOT_PATH:=/usr/bin:/usr/sbin:/bin:/sbin}"
     : "${BPM_ENV_KEEP:=http_proxy https_proxy ftp_proxy no_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY NO_PROXY SOURCE_DATE_EPOCH}"
+    : "${BPM_KEEP:=}"
+    : "${BPM_AUTOREMOVE:=0}"
     : "${BPM_STRIP:=1}"
     : "${BPM_CHECK:=0}"
     : "${BPM_COMPRESS:=gz}"
@@ -127,6 +129,7 @@ config_load() {
 
     export BPM_ROOT BPM_CACHE BPM_REPOS BPM_REPODIR BPM_REPOCONF BPM_USECONF \
            BPM_HOOKDIR BPM_CHO BPM_JOBS BPM_USE BPM_SANDBOX BPM_STRIP BPM_CHECK \
+           BPM_KEEP BPM_AUTOREMOVE \
            BPM_COMPRESS BPM_FORCE BPM_CONF BPM_LIBDIR BPM_DB BPM_LOGDIR BPM_VERBOSE \
            BPM_BUILDROOT BPM_BASEPKGS BPM_BROOT_OVERLAY BPM_BROOT_KEEP \
            BPM_BROOT_PATH BPM_ENV_KEEP \

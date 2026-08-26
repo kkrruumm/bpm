@@ -4,7 +4,7 @@
 #
 set -eu
 
-BPM_PROGVER=0.6
+BPM_PROGVER=0.7
 
 # where the fuck am i so we can re-exec into the sandbox and into root
 case $0 in
@@ -36,7 +36,10 @@ usage: bpm <command> [argument ...]
 
   [b]uild    pkg...   build packages and any missing dependencies
   [i]nstall  pkg...   build if needed, then install into \$BPM_ROOT
-  [r]emove   pkg...   remove installed packages
+  [r]emove   pkg...   remove installed packages, -a also removes the orphans
+                      that leaves behind, -f skips the reverse dependency check
+  autoremove          remove every orphaned package, -n lists them instead,
+                      -y skips the prompt
   [u]pdate            pull repositories, rebuild and install what changed
   [p]ull              clone or pull repositories only
   [s]earch   pattern  search repositories (globs allowed)
@@ -45,7 +48,9 @@ usage: bpm <command> [argument ...]
   verify     [pkg...] list files that no longer match what was packaged,
                       -c includes config files, --overwrite <pkg> <path>
                       restores the specified file from the archive
-  [l]ist     [pkg]    list installed packages
+  [l]ist     [-r] [pkg]
+                      list installed packages, -r appends the reason each package
+                      was installed
   [f]iles    pkg      list files owned by an installed package
   [o]wns     path     show which package owns a path
   [c]hecksum [-w] pkg print blake3 sums of the dist_files (-w rewrites template)
@@ -197,20 +202,119 @@ cmd_install() {
     msg "install order: $_order"
     for _p in $_order; do build_one "$_p"; done
 
-    _ars=
+    # what the user entered is explicit, whatever deps_order appended isnt
+    # so removing the one thing that *was* wanted makes the rest collectable
+    # BPM_MARK is so updates don't fuck with install reasons
+    _named=" $* "
+    _args= _last=
     for _p in $_order; do
         tmpl_load "$_p"
         pkg_save_old "$_p"
-        _ars="$_ars $pkg_ar"
+        case $_named in
+            *" $_p "*) _m=${BPM_MARK:-explicit} ;;
+            *) _m=auto ;;
+        esac
+        if [ "$_m" != "$_last" ]; then _args="$_args --$_m"; _last=$_m; fi
+        _args="$_args $pkg_ar"
     done
     # shellcheck disable=SC2086
-    as_root "$BPM_SELF" __install $_ars
+    as_root "$BPM_SELF" __install $_args
 }
 
 cmd_remove() {
+    _sweep=$BPM_AUTOREMOVE _force=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -a|--autoremove) _sweep=1 ;;
+            -A|--no-autoremove) _sweep=0 ;;
+            -f|--force) _force=1 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1 (try 'bpm help')" ;;
+            *) break ;;
+        esac
+        shift
+    done
     [ $# -gt 0 ] || usage
+    for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+
+    # packages left behind that depend on something that's about to get thanos snapped
+    # anything else in the same removal doesnt count
+    if [ "$_force" = 0 ]; then
+        BPM_OMIT=$*
+        _held=
+        for _p; do
+            for _r in $(pkg_rdeps "$_p"); do _held="$_held $_r->$_p"; done
+        done
+        BPM_OMIT=
+        [ -z "$_held" ] || die "these would be left with missing dependencies:$_held
+    remove them too, or pass -f to do it anyway"
+    fi
+
+    # the sweep gets put into the same removal instead of running after it so there's
+    # only one escalation and pass over the disk
+    _rm=$*
+    if [ "$_sweep" = 1 ]; then
+        _orph=$(pkg_orphans "$@" | tr '\n' ' ')
+        if [ -n "$_orph" ]; then
+            msg "also removing orphaned: $_orph"
+            _rm="$_rm $_orph"
+        fi
+    fi
+
     # shellcheck disable=SC2086
-    as_root "$BPM_SELF" __remove "$@"
+    _rm=$(remove_order $_rm)
+    # shellcheck disable=SC2086
+    as_root "$BPM_SELF" __remove $_rm
+
+    if [ "$_sweep" = 0 ]; then
+        _orph=$(pkg_orphans | tr '\n' ' ')
+        if [ -n "$_orph" ]; then
+            _n=0
+            for _p in $_orph; do _n=$((_n + 1)); done
+            warn "$_n package(s) are now orphaned, remove them with 'bpm autoremove'"
+        fi
+    fi
+}
+
+cmd_autoremove() {
+    _dry=0 _yes=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -n|--dry-run) _dry=1 ;;
+            -y|--yes) _yes=1 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1 (try 'bpm help')" ;;
+            *) break ;;
+        esac
+        shift
+    done
+    [ $# -eq 0 ] || die "autoremove takes no package arguments (try 'bpm help')"
+
+    _orph=$(pkg_orphans | tr '\n' ' ')
+    if [ -z "$_orph" ]; then msg "no orphaned packages"; return 0; fi
+
+    # shellcheck disable=SC2086
+    _orph=$(remove_order $_orph)
+    _n=0
+    for _p in $_orph; do _n=$((_n + 1)); done
+    msg "$_n orphaned package(s):"
+    for _p in $_orph; do sub "$_p $(cat "$BPM_DB/$_p/version")"; done
+    [ "$_dry" = 0 ] || return 0
+
+    # the remove list bpm decides on isn't explicitly entered by the user
+    # so this requires confirmation from the user unless -y
+    if [ "$_yes" = 0 ]; then
+        [ -t 0 ] || die "not a terminal, pass -y to remove these"
+        printf 'remove these? [y/N] ' >&2
+        read -r _a || _a=
+        case $_a in
+            y|Y|yes|YES) ;;
+            *) msg "nothing removed"; return 0 ;;
+        esac
+    fi
+
+    # shellcheck disable=SC2086
+    as_root "$BPM_SELF" __remove $_orph
 }
 
 # repository shit
@@ -251,8 +355,12 @@ cmd_update() {
     done
     if [ -z "$_out" ]; then msg "everything is up to date"; return 0; fi
     msg "to update:$_out"
+    # an update isnt a request for any of these, a package that got pulled as a dep
+    # stays a dep after it's rebuilt
+    BPM_MARK=keep
     # shellcheck disable=SC2086
     cmd_install $_out
+    BPM_MARK=explicit
 }
 
 # query shit
@@ -282,10 +390,25 @@ cmd_query() {
         printf 'accounts    %s\ngroups      %s\n' "${system_accounts:-}" "${system_groups:-}"
     fi
     printf 'template    %s\n' "$tmpl_dir/template"
-    if pkg_installed "$1"; then printf 'installed   %s\n' "$(cat "$BPM_DB/$1/version")"; fi
+    if pkg_installed "$1"; then
+        printf 'installed   %s (%s)\n' "$(cat "$BPM_DB/$1/version")" "$(pkg_reason "$1")"
+        _rd=$(pkg_rdeps "$1" | tr '\n' ' ')
+        printf 'required by %s\n' "${_rd:-nothing}"
+    fi
 }
 
 cmd_list() {
+    _lr=0
+    if [ "${1:-}" = -r ]; then _lr=1; shift; fi
+    if [ "$_lr" = 1 ]; then
+        # shellcheck disable=SC2046
+        [ $# -gt 0 ] || set -- $(pkg_all)
+        for _p; do
+            pkg_installed "$_p" || die "$_p is not installed"
+            printf '%s %s %s\n' "$_p" "$(cat "$BPM_DB/$_p/version")" "$(pkg_reason "$_p")"
+        done
+        return 0
+    fi
     if [ $# -gt 0 ]; then
         for _p; do
             pkg_installed "$_p" || die "$_p is not installed"
@@ -448,7 +571,19 @@ cmd__build() {
     build_run "$1"
 }
 
-cmd__install() { for _a; do pkg_install "$_a"; done; }
+# all of the flags here apply to every package that follows them so
+# just 1 escalation can install what was requested and what came with it
+# and still tell them apart
+cmd__install() {
+    _mode=explicit
+    for _a; do
+        case $_a in
+            --explicit|--auto|--keep) _mode=${_a#--}; continue ;;
+        esac
+        pkg_install "$_a"
+        pkg_mark_installed "$(ar_name "$_a")" "$_mode"
+    done
+}
 cmd__remove() { for _p; do pkg_remove "$_p"; done; }
 cmd__swap() { pkg_swap "$1" "$2"; }
 cmd__restore() { pkg_restore "$1" "$2"; }
@@ -474,6 +609,7 @@ case $cmd in
     b|build) cmd_build "$@" ;;
     i|install) cmd_install "$@" ;;
     r|remove) cmd_remove "$@" ;;
+    autoremove) cmd_autoremove "$@" ;;
     u|update) cmd_update "$@" ;;
     p|pull) cmd_pull "$@" ;;
     s|search) cmd_search "$@" ;;
