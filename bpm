@@ -468,7 +468,7 @@ cmd_verify() {
     _st=0
     for _p; do pkg_verify "$_p" || _st=1; done
     if [ "$BPM_VERIFY_NOSUMS" -gt 0 ]; then
-        warn "$BPM_VERIFY_NOSUMS package(s) predate sums and were not checked"
+        warn "$BPM_VERIFY_NOSUMS package(s) lack checksums and cannot be verified."
     fi
     if [ "$_st" = 0 ]; then msg "no mismatches"; fi
     return "$_st"
