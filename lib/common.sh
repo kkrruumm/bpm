@@ -383,8 +383,8 @@ fetch_url() {
     sub "fetch ${1}"
     case $1 in
         file://*) cp -f "${1#file://}" "$2.part" ;;
-        *) if have curl; then curl -fL --retry 3 -o "$2.part" "$1"
-           elif have wget; then wget -O "$2.part" "$1"
+        *) if have curl; then curl -fL --retry 4 --retry-delay 10 -o "$2.part" "$1"
+           elif have wget; then wget -O --tries=5 --waitretry=10 "$2.part" "$1"
            else die "neither curl nor wget found"; fi ;;
     esac
     mv -f "$2.part" "$2"
