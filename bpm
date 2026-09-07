@@ -4,7 +4,7 @@
 #
 set -eu
 
-BPM_PROGVER=0.7
+BPM_PROGVER=0.8
 
 # where the fuck am i so we can re-exec into the sandbox and into root
 case $0 in
@@ -41,6 +41,9 @@ usage: bpm <command> [argument ...]
   autoremove          remove every orphaned package, -n lists them instead,
                       -y skips the prompt
   [u]pdate            pull repositories, rebuild and install what changed
+  pin        [pkg...] pin packages at their installed version, no args
+                      lists what is pinned
+  unpin      pkg...   release the pin
   [p]ull              clone or pull repositories only
   [s]earch   pattern  search repositories (globs allowed)
   [q]uery    pkg      show template metadata and resolved use flags
@@ -198,6 +201,15 @@ cmd_build() {
 
 cmd_install() {
     [ $# -gt 0 ] || usage
+    # deps order wont install a package that's already installed
+    # so ez hack is to just treat a pinned package like its already installed
+    for _p; do
+        if pkg_pinned "$_p"; then
+            die "$_p is pinned at $(cat "$BPM_DB/$_p/version")
+    release it first with:
+        bpm unpin $_p"
+        fi
+    done
     _order=$(deps_order "$@")
     msg "install order: $_order"
     for _p in $_order; do build_one "$_p"; done
@@ -338,7 +350,7 @@ cmd_pull() {
 
 cmd_update() {
     cmd_pull
-    _out=
+    _out= _held=
     for _d in "$BPM_DB"/*/; do
         [ -f "$_d/version" ] || continue
         _p=${_d%/}; _p=${_p##*/}
@@ -350,10 +362,19 @@ cmd_update() {
         _oldu=$(cat "$_d/use" 2>/dev/null || echo)
         tmpl_load "$_p"
         if [ "$_oldv" != "$pkg_ver" ] || [ "$_oldu" != "$(use_effective)" ]; then
+            if pkg_pinned "$_p"; then
+                _held="$_held $_p"
+                continue
+            fi
             _out="$_out $_p"
         fi
     done
-    if [ -z "$_out" ]; then msg "everything is up to date"; return 0; fi
+    [ -z "$_held" ] || msg "pinned, not updating:$_held"
+    if [ -z "$_out" ]; then
+        if [ -n "$_held" ]; then msg "nothing else to update"
+        else msg "everything is up to date"; fi
+        return 0
+    fi
     msg "to update:$_out"
     # an update isnt a request for any of these, a package that got pulled as a dep
     # stays a dep after it's rebuilt
@@ -361,6 +382,26 @@ cmd_update() {
     # shellcheck disable=SC2086
     cmd_install $_out
     BPM_MARK=explicit
+}
+
+cmd_pin() {
+    if [ $# -eq 0 ]; then
+        _any=0
+        for _p in $(pkg_pins); do
+            _any=1
+            printf '%s %s\n' "$_p" "$(cat "$BPM_DB/$_p/version")"
+        done
+        [ "$_any" = 1 ] || msg "nothing is pinned"
+        return 0
+    fi
+    for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+    as_root "$BPM_SELF" __pin "$@"
+}
+
+cmd_unpin() {
+    [ $# -gt 0 ] || usage
+    for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+    as_root "$BPM_SELF" __unpin "$@"
 }
 
 # query shit
@@ -391,7 +432,9 @@ cmd_query() {
     fi
     printf 'template    %s\n' "$tmpl_dir/template"
     if pkg_installed "$1"; then
-        printf 'installed   %s (%s)\n' "$(cat "$BPM_DB/$1/version")" "$(pkg_reason "$1")"
+        if pkg_pinned "$1"; then _pin=', pinned'; else _pin=; fi
+        printf 'installed   %s (%s%s)\n' \
+            "$(cat "$BPM_DB/$1/version")" "$(pkg_reason "$1")" "$_pin"
         _rd=$(pkg_rdeps "$1" | tr '\n' ' ')
         printf 'required by %s\n' "${_rd:-nothing}"
     fi
@@ -585,6 +628,8 @@ cmd__install() {
     done
 }
 cmd__remove() { for _p; do pkg_remove "$_p"; done; }
+cmd__pin() { for _p; do pkg_pin "$_p"; done; }
+cmd__unpin() { for _p; do pkg_unpin "$_p"; done; }
 cmd__swap() { pkg_swap "$1" "$2"; }
 cmd__restore() { pkg_restore "$1" "$2"; }
 
@@ -612,6 +657,8 @@ case $cmd in
     autoremove) cmd_autoremove "$@" ;;
     u|update) cmd_update "$@" ;;
     p|pull) cmd_pull "$@" ;;
+    pin) cmd_pin "$@" ;;
+    unpin) cmd_unpin "$@" ;;
     s|search) cmd_search "$@" ;;
     q|query) cmd_query "$@" ;;
     a|alternatives) cmd_alternatives "$@" ;;
@@ -630,6 +677,8 @@ case $cmd in
     __build) cmd__build "$@" ;;
     __install) cmd__install "$@" ;;
     __remove) cmd__remove "$@" ;;
+    __pin) cmd__pin "$@" ;;
+    __unpin) cmd__unpin "$@" ;;
     __swap) cmd__swap "$@" ;;
     __restore) cmd__restore "$@" ;;
     *) die "unknown command: $cmd (try 'bpm help')" ;;

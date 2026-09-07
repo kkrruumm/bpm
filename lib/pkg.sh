@@ -381,6 +381,38 @@ pkg_mark_installed() {
     esac
 }
 
+# pins
+#
+# a pin is just an empty file in the packages db
+#
+# a pinned package is kept at whatever version is installed, bpm wont touch it
+# until the user unpins it
+
+pkg_pinned() { [ -f "$BPM_DB/$1/pin" ]; }
+
+pkg_pin() {
+    pkg_installed "$1" || die "$1 is not installed"
+    if pkg_pinned "$1"; then sub "$1 is already pinned"; return 0; fi
+    : > "$BPM_DB/$1/pin"
+    msg "pinned $1 at $(cat "$BPM_DB/$1/version")"
+}
+
+pkg_unpin() {
+    pkg_installed "$1" || die "$1 is not installed"
+    if ! pkg_pinned "$1"; then sub "$1 is not pinned"; return 0; fi
+    rm -f "$BPM_DB/$1/pin"
+    msg "unpinned $1"
+}
+
+# every pinned package
+pkg_pins() {
+    for _pp in "$BPM_DB"/*/; do
+        [ -f "$_pp/pin" ] || continue
+        _pp=${_pp%/}
+        printf '%s\n' "${_pp##*/}"
+    done
+}
+
 # orphans
 #
 # the runtime dependencies as they were recorded when <pkg> was installed
