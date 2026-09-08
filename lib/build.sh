@@ -152,6 +152,26 @@ write_db() {
     manifest_create > "$_d/manifest"
 }
 
+# apparently gtar will blow up a symlink by default
+# if it's the target of an extraction, so don't allow packages to be built
+# that would do that, examples of this could be like /var/run or bin/sbin
+#
+# plain files are fine as the symlink will resolve in that case,
+# it's just directories that are problematic with gtar
+#
+# the buildroot has the same baselayout the host does so we can just check
+# here
+dest_check_layout() {
+    _bad=$(grep '/$' "$DESTDIR/var/db/bpm/installed/$pkg_name/manifest" |
+           while IFS= read -r _p; do
+               if [ -h "${_p%/}" ]; then printf '    %s\n' "${_p%/}"; fi
+           done)
+    [ -z "$_bad" ] || die "$pkg_name ships directories where the root has symlinks:
+$_bad
+    installing it would replace each of those with a real directory
+    drop them at the end of post_install, e.g. brm /var/run"
+}
+
 create_archive() {
     mkdir -p "${pkg_ar%/*}"
     ( cd "$DESTDIR" && tar cf - . ) | comp "$pkg_ar" > "$pkg_ar.part"
@@ -208,6 +228,7 @@ build_run() {
 
     post_process
     write_db
+    dest_check_layout
     create_archive
 }
 
