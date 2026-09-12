@@ -152,24 +152,46 @@ write_db() {
     manifest_create > "$_d/manifest"
 }
 
-# apparently gtar will blow up a symlink by default
-# if it's the target of an extraction, so don't allow packages to be built
-# that would do that, examples of this could be like /var/run or bin/sbin
+# this folds $DESTDIR dirs that are symlinks in the live root into whatever
+# the point at so packages only ever carry the real dir
 #
-# plain files are fine as the symlink will resolve in that case,
-# it's just directories that are problematic with gtar
+# this fucking mess was spawned by gtar replacing symlinks with real directories
+# when it extracts a directory entry over one
 #
-# the buildroot has the same baselayout the host does so we can just check
-# here
-dest_check_layout() {
-    _bad=$(grep '/$' "$DESTDIR/var/db/bpm/installed/$pkg_name/manifest" |
-           while IFS= read -r _p; do
-               if [ -h "${_p%/}" ]; then printf '    %s\n' "${_p%/}"; fi
-           done)
-    [ -z "$_bad" ] || die "$pkg_name ships directories where the root has symlinks:
-$_bad
-    installing it would replace each of those with a real directory
-    drop them at the end of post_install, e.g. brm /var/run"
+# this also keeps the manifest accurate as to where it put stuff
+dest_fold_symlinks() {
+    while :; do
+        _fold=
+        # shortest path first so /usr/sbin folds before anything beneath it
+        for _p in $( cd "$DESTDIR" && find . -mindepth 1 -type d |
+                     sed 's|^\.||' |
+                     awk '{ n = gsub(/\//, "/"); print n, $0 }' |
+                     sort -n -k1,1 | cut -d' ' -f2- ); do
+            if [ -h "$BPM_ROOT$_p" ]; then _fold=$_p; break; fi
+        done
+        [ -n "$_fold" ] || return 0
+
+        _tgt=$(readlink "$BPM_ROOT$_fold")
+        case $_tgt in
+            /*) ;;
+            *) _tgt=${_fold%/*}/$_tgt ;; # relative to the links own directory
+        esac
+        [ -d "$BPM_ROOT$_tgt" ] ||
+            die "dest_fold_symlinks: $_fold -> $_tgt is not a directory in the root"
+        case $_tgt in
+            "$_fold"|"$_fold"/*)
+                die "dest_fold_symlinks: $_fold -> $_tgt is circular" ;;
+        esac
+
+        sub "folding $_fold into $_tgt"
+        mkdir -p "$DESTDIR$_tgt"
+        # tar is used here instead of mv so nested dirs merge instead of nest
+        # and so dotfiles are not missed + modes like setuid survive
+        ( cd "$DESTDIR$_fold" && tar cf - . ) |
+            ( cd "$DESTDIR$_tgt" && tar xf - ) ||
+            die "dest_fold_symlinks: could not merge $_fold into $_tgt"
+        rm -rf "$DESTDIR$_fold"
+    done
 }
 
 create_archive() {
@@ -227,8 +249,8 @@ build_run() {
     phase install
 
     post_process
+    dest_fold_symlinks
     write_db
-    dest_check_layout
     create_archive
 }
 
