@@ -225,7 +225,12 @@ pkg_install() {
 
     # on upgrade drop files the new version no longer ships
     if [ -f "$_tmp/old" ]; then
-        grep -vxFf "$_tmp/new" "$_tmp/old" > "$_tmp/stale" || :
+        cp "$BPM_DB/$_name/manifest" "$_tmp/new"
+        # a path this package lost to an alternative is in the old manifest
+        # and not the new one, but it is still on disk and belongs to whoever
+        # holds it now, never fuck with anything another package owns
+        grep -vxFf "$_tmp/new" "$_tmp/old" |
+            grep -vxFf "$_tmp/foreign" > "$_tmp/stale" || :
         while read -r f; do
             case $f in
                 */) rmdir "$BPM_ROOT$f" 2>/dev/null || : ;;
