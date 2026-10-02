@@ -143,7 +143,9 @@ write_db() {
     cp "$tmpl_dir/template" "$_d/template"
     printf '%s\n' "$pkg_ver" > "$_d/version"
     printf '%s\n' "$(use_effective)"  > "$_d/use"
-    printf '%s\n' "${depends:-}" > "$_d/depends"
+    # one per line, this is a correction for the way depends get listed
+    # in package templates
+    (set -f; for _dd in ${depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/depends"
     acct_records > "$_d/accounts"
     [ -s "$_d/accounts" ] || rm -f "$_d/accounts"
     sums_create > "$_d/sums"

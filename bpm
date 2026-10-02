@@ -421,22 +421,48 @@ cmd_search() {
 cmd_query() {
     [ $# -gt 0 ] || usage
     tmpl_load "$1"
-    printf 'pkg_name    %s\nversion     %s\nrevision    %s\nbuild_style %s\n' \
-        "$pkg_name" "$version" "$revision" "$build_style"
-    printf 'short_desc  %s\nhome_page   %s\nlicense     %s\n' \
-        "${short_desc:-}" "${home_page:-}" "${license:-}"
-    printf 'depends     %s\nmakedepends %s\n' "${depends:-}" "${make_depends:-}"
-    printf 'use_flags   %s\nuse         %s\n' "${use_flags:-}" "$(use_effective)"
-    if [ -n "${system_accounts:-}${system_groups:-}" ]; then
-        printf 'accounts    %s\ngroups      %s\n' "${system_accounts:-}" "${system_groups:-}"
+    # wrap to $COLUMNS (or 80) on a terminal, one line per field when piped
+    _qw=0
+    if [ -t 1 ]; then
+        _qw=${COLUMNS:-80}
+        case $_qw in ''|0|*[!0-9]*) _qw=80 ;; esac
     fi
-    printf 'template    %s\n' "$tmpl_dir/template"
+    # templates usually put depends/use_flags on several lines and
+    # use_if leaves gaps so this splits the value into words and then
+    # outputs them again with indentations under the first value
+    _qf() {
+        _ql=$(printf '%-11s' "$1"); _qn=11
+        set -f; set -- $2; set +f
+        for _qv; do
+            if [ "$_qw" -gt 0 ] && [ "$_qn" -gt 11 ] &&
+               [ $((_qn + 1 + ${#_qv})) -gt "$_qw" ]; then
+                printf '%s\n' "$_ql"; _ql='           '; _qn=11
+            fi
+            _ql="$_ql $_qv"; _qn=$((_qn + 1 + ${#_qv}))
+        done
+        printf '%s\n' "$_ql"
+    }
+    _qf pkg_name "$pkg_name"
+    _qf version "$version"
+    _qf revision "$revision"
+    _qf build_style "$build_style"
+    _qf short_desc "${short_desc:-}"
+    _qf home_page "${home_page:-}"
+    _qf license "${license:-}"
+    _qf depends "${depends:-}"
+    _qf makedepends "${make_depends:-}"
+    _qf use_flags "${use_flags:-}"
+    _qf use "$(use_effective)"
+    if [ -n "${system_accounts:-}${system_groups:-}" ]; then
+        _qf accounts "${system_accounts:-}"
+        _qf groups "${system_groups:-}"
+    fi
+    _qf template "$tmpl_dir/template"
     if pkg_installed "$1"; then
         if pkg_pinned "$1"; then _pin=', pinned'; else _pin=; fi
-        printf 'installed   %s (%s%s)\n' \
-            "$(cat "$BPM_DB/$1/version")" "$(pkg_reason "$1")" "$_pin"
+        _qf installed "$(cat "$BPM_DB/$1/version") ($(pkg_reason "$1")$_pin)"
         _rd=$(pkg_rdeps "$1" | tr '\n' ' ')
-        printf 'required by %s\n' "${_rd:-nothing}"
+        _qf 'required by' "${_rd:-nothing}"
     fi
 }
 
