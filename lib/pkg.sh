@@ -81,9 +81,12 @@ same_file() {
     fi
 }
 
+# hooks <event> <pkg> [version]
+# every hook gets <pkg_name> <root> <version>, version is version-revision
+# and is the version being installed or removed
 hooks() {
     for _h in "$BPM_HOOKDIR/$1"/*; do
-        if [ -x "$_h" ]; then "$_h" "$2" "$BPM_ROOT/" || warn "hook ${_h##*/} failed"; fi
+        if [ -x "$_h" ]; then "$_h" "$2" "$BPM_ROOT/" "${3:-}" || warn "hook ${_h##*/} failed"; fi
     done
 }
 
@@ -181,7 +184,7 @@ pkg_install() {
     ar_member "$_ar" "./var/db/bpm/installed/$_name/accounts" > "$_tmp/accounts" 2>/dev/null || :
     accounts_apply "$_tmp/accounts"
 
-    hooks pre-install "$_name"
+    hooks pre-install "$_name" "$_ver"
     msg "installing $_name-$_ver"
 
     set -f
@@ -240,7 +243,7 @@ pkg_install() {
         rm -f "$_tmp/old"
     fi
 
-    hooks post-install "$_name"
+    hooks post-install "$_name" "$_ver"
     rm -rf "$_tmp/cfgstage"
     rm -f "$_tmp/new" "$_tmp/foreign" "$_tmp/conflict" "$_tmp/stale" \
           "$_tmp/accounts" "$_tmp/sums" "$_tmp/oldsums" "$_tmp/cfg"
@@ -274,6 +277,8 @@ tools_stage() {
 pkg_remove() {
     _name=$1
     pkg_installed "$_name" || die "$_name is not installed"
+    # read before the db entry is deleted so post-remove hooks still get it
+    _rver=$(cat "$BPM_DB/$_name/version" 2>/dev/null || :)
 
     # anything still needed by another package stays
     _tmp=$BPM_CACHE/tmp/$_name; mkdir -p "$_tmp"
@@ -303,7 +308,7 @@ pkg_remove() {
         : > "$_tmp/rmcfg"; cp "$_tmp/rm" "$_tmp/rmrest"
     fi
 
-    hooks pre-remove "$_name"
+    hooks pre-remove "$_name" "$_rver"
     msg "removing $_name"
 
     _oldpath=$PATH
@@ -337,7 +342,7 @@ pkg_remove() {
     # hooks keep the staged tools becuase they're likely to need a util
     # the package being removed used to provide
     # the staged rm should be able to delete the directory it lives in
-    hooks post-remove "$_name"
+    hooks post-remove "$_name" "$_rver"
     rm -rf "$BPM_CACHE/tmp/.tools" 2>/dev/null || :
     PATH=$_oldpath
 }

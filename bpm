@@ -4,7 +4,7 @@
 #
 set -eu
 
-BPM_PROGVER=0.8
+BPM_PROGVER=0.9
 
 # where the fuck am i so we can re-exec into the sandbox and into root
 case $0 in
