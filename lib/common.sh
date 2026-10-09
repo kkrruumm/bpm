@@ -30,6 +30,58 @@ log_tail() {
     printf '\n' >&2
 }
 
+# the spinner, the fetch jobs and whatever killable() is waiting on
+# PIDs of background processes bpm needs to kill when it gets interrupted
+# the spinner, the fetch jobs, and whatever killable() is waiting on
+_sp_pid= _pf_run= _k_pid=
+
+interrupted() {
+    trap - INT TERM HUP
+    for _ip in $_k_pid $_sp_pid $_pf_run; do kill "${_ip%%:*}" 2>/dev/null || :; done
+    wait 2>/dev/null || :
+    if spin_on; then spin_clear; fi
+    warn interrupted
+    exit "$1"
+}
+
+# without some form of job control a background command ignores SIGINT
+# and the shell only runs a trap once its foreground comnand returns so
+# this runs the command in the background and waits on it which a trap
+# can interrupt, see above function
+killable() {
+    "$@" &
+    _k_pid=$!
+    _k_st=0
+    wait "$_k_pid" || _k_st=$?
+    _k_pid=
+    return "$_k_st"
+}
+
+# spinner, only when stderr is a terminal and output isn't verbose
+# POSIX sleep only takes whole seconds so it ticks once a second
+spin_on() { [ -t 2 ] && [ "$BPM_VERBOSE" = 0 ]; }
+spin_clear() { printf '\r\033[K' >&2; }
+
+spin_start() {
+    spin_on || return 0
+    _sp_text=$1 _sp_t0=$(date +%s)
+    ( set -- '|' '/' '-' '\'
+      while kill -0 "$$" 2>/dev/null; do
+          printf "\r${CB}   ->${CN} %s %s %s\033[K" "$_sp_text" "$1" "$(elapsed "$_sp_t0")" >&2
+          set -- "$2" "$3" "$4" "$1"
+          sleep 1
+      done ) &
+    _sp_pid=$!
+}
+
+spin_stop() {
+    [ -n "$_sp_pid" ] || return 0
+    kill "$_sp_pid" 2>/dev/null || :
+    wait "$_sp_pid" 2>/dev/null || :
+    _sp_pid=
+    spin_clear
+}
+
 # run_logged <label> <logfile> <command>... - returns the commands status
 run_logged() {
     _rl_label=$1 _rl_log=$2
@@ -39,7 +91,9 @@ run_logged() {
     _rl_st=0
 
     if [ "$BPM_VERBOSE" = 0 ]; then
+        spin_start "$_rl_label"
         "$@" > "$_rl_log" 2>&1 || _rl_st=$?
+        spin_stop
     else
         # status comes back through a file
         _rl_rc=$BPM_CACHE/tmp/rc.$$
@@ -89,6 +143,7 @@ config_load() {
     : "${BPM_LOGDIR:=$BPM_CACHE/logs}"
     : "${BPM_CHO:=var/db/bpm/choices}"
     : "${BPM_JOBS:=$(cpu_count)}"
+    : "${BPM_FETCH_JOBS:=4}"
     : "${BPM_USE:=}"
     : "${BPM_SANDBOX:=1}"
     : "${BPM_BUILDROOT:=}"
@@ -115,6 +170,9 @@ config_load() {
 
     for _e in $_empty; do eval "$_e="; done
 
+    case $BPM_FETCH_JOBS in
+        ''|0|*[!0-9]*) die "BPM_FETCH_JOBS must be 1 or more, got '$BPM_FETCH_JOBS'" ;;
+    esac
     BPM_ROOT=${BPM_ROOT%/}
     BPM_BUILDROOT=${BPM_BUILDROOT%/}
     BPM_DB=$BPM_ROOT/var/db/bpm/installed
@@ -131,6 +189,7 @@ config_load() {
            BPM_HOOKDIR BPM_CHO BPM_JOBS BPM_USE BPM_SANDBOX BPM_STRIP BPM_CHECK \
            BPM_KEEP BPM_AUTOREMOVE \
            BPM_COMPRESS BPM_FORCE BPM_CONF BPM_LIBDIR BPM_DB BPM_LOGDIR BPM_VERBOSE \
+           BPM_FETCH_JOBS \
            BPM_BUILDROOT BPM_BASEPKGS BPM_BROOT_OVERLAY BPM_BROOT_KEEP \
            BPM_BROOT_PATH BPM_ENV_KEEP \
            CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS GOFLAGS CGO_ENABLED ZIGFLAGS GOAMD64
@@ -383,8 +442,9 @@ fetch_url() {
     sub "fetch ${1}"
     case $1 in
         file://*) cp -f "${1#file://}" "$2.part" ;;
-        *) if have curl; then curl -fL --retry 4 --retry-delay 10 -o "$2.part" "$1"
-           else die "curl not found"; fi ;;
+        *) have curl || die "curl not found"
+           killable curl -fsSL --retry 4 --retry-delay 10 -o "$2.part" "$1" ||
+               die "download failed: $1" ;;
     esac
     mv -f "$2.part" "$2"
 }
@@ -394,13 +454,13 @@ fetch_git() {
     [ "$_ref" = "$_url" ] && _ref=HEAD || :
     if [ -d "$2/.git" ]; then
         sub "update $_url"
-        git -C "$2" fetch -q --tags origin
+        killable git -C "$2" fetch -q --tags origin
     else
         sub "clone $_url"
-        git clone -q "$_url" "$2"
+        killable git clone -q "$_url" "$2"
     fi
     git -C "$2" checkout -q --detach "$_ref"
-    git -C "$2" submodule -q update --init --recursive
+    killable git -C "$2" submodule -q update --init --recursive
 }
 
 src_fetch() {
@@ -440,4 +500,73 @@ src_verify() {
     got      $_got"
         fi
     done
+}
+
+# every package a resolved build order will try to build plus with a build root
+# the make_depends and broot_prebuild builds for them
+fetch_targets() {
+    _ft_seen=' ' _ft_out=
+    for _ftp; do
+        if [ "$BPM_FORCE" = 1 ] || ! ar_current "$_ftp"; then fetch_walk "$_ftp"; fi
+    done
+    printf '%s\n' "${_ft_out# }"
+}
+
+fetch_walk() {
+    case $_ft_seen in *" $1 "*) return 0 ;; esac
+    _ft_seen="$_ft_seen$1 "
+    _ft_out="$_ft_out $1"
+    [ -n "$BPM_BUILDROOT" ] || return 0
+    # shellcheck disable=SC2046
+    for _ftd in $(rdeps_closure $(tmpl_get "$1" make_depends)); do
+        ar_current "$_ftd" || fetch_walk "$_ftd"
+    done
+}
+
+# prefetch <pkg> - fetch and verify sources BPM_FETCH_JOBS packages at a time,
+# each into $BPM_LOGDIR/<pkg>.fetch.log (maybe it would be reasonable to
+# write a logviewer at some point for that? idk)
+prefetch() {
+    [ $# -gt 0 ] || return 0
+    mkdir -p "$BPM_LOGDIR"
+    msg "fetching sources for $# package(s), $BPM_FETCH_JOBS at a time"
+    spin_start fetching
+    _pf_n=0 _pf_fail=
+    for _pfp; do
+        fetch_job "$_pfp"
+        _pf_run="$_pf_run $!:$_pfp"
+        _pf_n=$((_pf_n + 1))
+        if [ "$_pf_n" -ge "$BPM_FETCH_JOBS" ]; then fetch_reap; fi
+    done
+    while [ -n "$_pf_run" ]; do fetch_reap; done
+    spin_stop
+
+    [ -n "$_pf_fail" ] || return 0
+    for _pfp in $_pf_fail; do log_tail "$BPM_LOGDIR/$_pfp.fetch.log"; done
+    die "fetching failed for:$_pf_fail"
+}
+
+# a job is a single subshell so killing its pid reaches the killable() inside
+fetch_job() {
+    ( trap 'kill "$_k_pid" 2>/dev/null; exit 143' TERM
+      exec > "$BPM_LOGDIR/$1.fetch.log" 2>&1
+      tmpl_load "$1"
+      if have do_fetch; then do_fetch; else src_fetch; fi
+      src_verify ) &
+}
+
+# waits on the oldest job, there's no portable way to wait for whatever
+# finishes first that i can find/think of (fuck POSIX but fine)
+fetch_reap() {
+    _pfe=${_pf_run# }; _pfe=${_pfe%% *}
+    _pf_run=${_pf_run#" $_pfe"}
+    _pf_n=$((_pf_n - 1))
+    _pfs=0
+    wait "${_pfe%%:*}" || _pfs=$?
+    _pfp=${_pfe#*:}
+    if [ "$_pfs" = 0 ]; then _pfr="${CG}ok${CN}"
+    else _pfr="${CR}failed${CN}"; _pf_fail="$_pf_fail $_pfp"; fi
+    _pfc=
+    if spin_on; then _pfc='\r\033[K'; fi
+    printf "$_pfc${CB}   ->${CN} %s $_pfr\n" "$_pfp" >&2
 }
