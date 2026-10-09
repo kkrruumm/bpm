@@ -544,7 +544,7 @@ prefetch() {
     mkdir -p "$BPM_LOGDIR" 2>/dev/null || :
     [ -w "$BPM_LOGDIR" ] || die "cannot write to $BPM_LOGDIR
     fix its ownership or point BPM_LOGDIR somewhere writable"
-    msg "fetching sources for $# package(s), $BPM_FETCH_JOBS at a time"
+    msg "fetching sources for $# package(s), parallel: $BPM_FETCH_JOBS"
     spin_start fetching
     _pf_n=0 _pf_fail=
     for _pfp; do
