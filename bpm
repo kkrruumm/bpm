@@ -199,8 +199,9 @@ cmd_build() {
     [ $# -gt 0 ] || usage
     _order=$(deps_order "$@")
     msg "build order: $_order"
-    # shellcheck disable=SC2046
-    prefetch $(fetch_targets $_order)
+    _fetch=$(fetch_targets $_order) || exit 1
+    # shellcheck disable=SC2086
+    prefetch $_fetch
     for _p in $_order; do build_one "$_p"; done
 }
 
@@ -217,8 +218,9 @@ cmd_install() {
     done
     _order=$(deps_order "$@")
     msg "install order: $_order"
-    # shellcheck disable=SC2046
-    prefetch $(fetch_targets $_order)
+    _fetch=$(fetch_targets $_order) || exit 1
+    # shellcheck disable=SC2086
+    prefetch $_fetch
     for _p in $_order; do build_one "$_p"; done
 
     # what the user entered is explicit, whatever deps_order appended isnt
@@ -590,6 +592,7 @@ cmd_checksum() {
 
 cmd_download() {
     [ $# -gt 0 ] || usage
+    for _p; do pkg_need "$_p"; done
     prefetch "$@"
 }
 

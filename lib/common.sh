@@ -356,6 +356,14 @@ tmpl_get() {
 # already installed dependencies are not revisited while explicitly named packages always are
 #
 # make_depends is intentionally not walked here
+# a missing template has to be caught before anything reads it from inside a subshell
+# where die only ends that subshell and the error repeats for literally every
+# later lookup of that package TODO
+pkg_need() {
+    pkg_find "$1" >/dev/null ||
+        die "package '$1' not found in any repository${2:+ (required by $2)}"
+}
+
 deps_order() {
     _seen=' ' _order=''
     for _p; do dep_walk "$_p"; done
@@ -365,8 +373,9 @@ deps_order() {
 dep_walk() {
     case $_seen in *" $1 "*) return 0 ;; esac
     _seen="$_seen$1 "
+    pkg_need "$1" "${2:-}"
     for _d in $(tmpl_get "$1" depends); do
-        if ! pkg_installed "$_d"; then dep_walk "$_d"; fi
+        if ! pkg_installed "$_d"; then dep_walk "$_d" "$1"; fi
     done
     _order="$_order$1 "
 }
@@ -386,7 +395,8 @@ rdeps_closure() {
 rdep_walk() {
     case $_rseen in *" $1 "*) return 0 ;; esac
     _rseen="$_rseen$1 "
-    for _rd in $(tmpl_get "$1" depends); do rdep_walk "$_rd"; done
+    pkg_need "$1" "${2:-}"
+    for _rd in $(tmpl_get "$1" depends); do rdep_walk "$_rd" "$1"; done
     _rout="$_rout$1 "
 }
 
@@ -517,8 +527,11 @@ fetch_walk() {
     _ft_seen="$_ft_seen$1 "
     _ft_out="$_ft_out $1"
     [ -n "$BPM_BUILDROOT" ] || return 0
-    # shellcheck disable=SC2046
-    for _ftd in $(rdeps_closure $(tmpl_get "$1" make_depends)); do
+    _ftm=$(tmpl_get "$1" make_depends)
+    for _ftd in $_ftm; do pkg_need "$_ftd" "$1"; done
+    # shellcheck disable=SC2086
+    _ftc=$(rdeps_closure $_ftm) || exit 1
+    for _ftd in $_ftc; do
         ar_current "$_ftd" || fetch_walk "$_ftd"
     done
 }
@@ -528,7 +541,9 @@ fetch_walk() {
 # write a logviewer at some point for that? idk)
 prefetch() {
     [ $# -gt 0 ] || return 0
-    mkdir -p "$BPM_LOGDIR"
+    mkdir -p "$BPM_LOGDIR" 2>/dev/null || :
+    [ -w "$BPM_LOGDIR" ] || die "cannot write to $BPM_LOGDIR
+    fix its ownership or point BPM_LOGDIR somewhere writable"
     msg "fetching sources for $# package(s), $BPM_FETCH_JOBS at a time"
     spin_start fetching
     _pf_n=0 _pf_fail=
@@ -548,6 +563,8 @@ prefetch() {
 
 # a job is a single subshell so killing its pid reaches the killable() inside
 fetch_job() {
+    # a log left from an earlier run must never be shown as this ones
+    rm -f "$BPM_LOGDIR/$1.fetch.log"
     ( trap 'kill "$_k_pid" 2>/dev/null; exit 143' TERM
       exec > "$BPM_LOGDIR/$1.fetch.log" 2>&1
       tmpl_load "$1"
