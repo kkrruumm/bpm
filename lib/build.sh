@@ -148,6 +148,8 @@ write_db() {
     (set -f; for _dd in ${depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/depends"
     (set -f; for _dd in ${use_depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/use_depends"
     [ -s "$_d/use_depends" ] || rm -f "$_d/use_depends"
+    (set -f; for _dd in ${register_shell-}; do printf '%s\n' "$_dd"; done ) > "$_d/shells"
+    [ -s "$_d/shells" ] || rm -f "$_d/shells"
     acct_records > "$_d/accounts"
     [ -s "$_d/accounts" ] || rm -f "$_d/accounts"
     sums_create > "$_d/sums"

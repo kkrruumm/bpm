@@ -243,18 +243,62 @@ pkg_install() {
         rm -f "$_tmp/old"
     fi
 
+    # on upgrade drop shells the new version no longer registers
+    if [ -f "$_tmp/oldshells" ]; then
+        _ns=$BPM_DB/$_name/shells; [ -f "$_ns" ] || _ns=/dev/null
+        grep -vxFf "$_ns" "$_tmp/oldshells" > "$_tmp/goneshells" || :
+        shells_del "$_tmp/goneshells" "$_name"
+    fi
+    shells_add "$BPM_DB/$_name/shells"
+
     hooks post-install "$_name" "$_ver"
     rm -rf "$_tmp/cfgstage"
     rm -f "$_tmp/new" "$_tmp/foreign" "$_tmp/conflict" "$_tmp/stale" \
-          "$_tmp/accounts" "$_tmp/sums" "$_tmp/oldsums" "$_tmp/cfg"
+          "$_tmp/accounts" "$_tmp/sums" "$_tmp/oldsums" "$_tmp/cfg" \
+          "$_tmp/oldshells" "$_tmp/goneshells"
+}
+
+# /etc/shells
+#
+# register_shell="/usr/bin/bash /bin/bash" adds those paths on install
+# and removes them on removal
+shells_add() {
+    [ -s "$1" ] || return 0
+    _sf=$BPM_ROOT/etc/shells
+    while IFS= read -r _s; do
+        [ -n "$_s" ] || continue
+        grep -qxF "$_s" "$_sf" 2>/dev/null && continue
+        printf '%s\n' "$_s" >> "$_sf"
+        sub "registered shell $_s"
+    done < "$1"
+}
+
+# $1 is the list to remove, $2 is the package removing them, a path some other
+# installed package also registers stays
+shells_del() {
+    _sf=$BPM_ROOT/etc/shells
+    [ -s "$1" ] && [ -f "$_sf" ] || return 0
+    _st=$BPM_CACHE/tmp/.shells; mkdir -p "$_st"
+    for _o in "$BPM_DB"/*/shells; do
+        if [ -f "$_o" ] && [ "$_o" != "$BPM_DB/$2/shells" ]; then cat "$_o"; fi
+    done > "$_st/keep"
+    grep -vxFf "$_st/keep" "$1" > "$_st/del" || :
+    if [ -s "$_st/del" ]; then
+        grep -vxFf "$_st/del" "$_sf" > "$_st/new" || :
+        # cat instead of mv so the owner and mode are left alone
+        cat "$_st/new" > "$_sf"
+        while IFS= read -r _s; do sub "unregistered shell $_s"; done < "$_st/del"
+    fi
+    rm -rf "$_st"
 }
 
 # back up the current manifest and checksum stuff before an upgrade
 # overwrites the db with the one from the new archive
 pkg_save_old() {
     _tmp=$BPM_CACHE/tmp/$1; mkdir -p "$_tmp"
-    rm -f "$_tmp/old" "$_tmp/oldsums"
+    rm -f "$_tmp/old" "$_tmp/oldsums" "$_tmp/oldshells"
     if [ -f "$BPM_DB/$1/manifest" ]; then cp "$BPM_DB/$1/manifest" "$_tmp/old"; fi
+    if [ -f "$BPM_DB/$1/shells" ]; then cp "$BPM_DB/$1/shells" "$_tmp/oldshells"; fi
     if [ -f "$BPM_DB/$1/sums" ]; then cp "$BPM_DB/$1/sums" "$_tmp/oldsums"; fi
 }
 
@@ -310,6 +354,7 @@ pkg_remove() {
 
     hooks pre-remove "$_name" "$_rver"
     msg "removing $_name"
+    shells_del "$BPM_DB/$_name/shells" "$_name"
 
     _oldpath=$PATH
     if tools_stage; then PATH=$_tsdir:$PATH

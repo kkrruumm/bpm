@@ -486,6 +486,7 @@ cmd_query() {
         _qf accounts "${system_accounts:-}"
         _qf groups "${system_groups:-}"
     fi
+    [ -z "${register_shell:-}" ] || _qf shells "$register_shell"
     _qf template "$tmpl_dir/template"
     if pkg_installed "$1"; then
         if pkg_pinned "$1"; then _pin=', pinned'; else _pin=; fi
