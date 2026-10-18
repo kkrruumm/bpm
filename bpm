@@ -418,9 +418,9 @@ cmd_unpin() {
 cmd_search() {
     [ $# -gt 0 ] || usage
     for _r in $BPM_REPOS; do
-        for _d in "$_r"/*/; do
-            [ -f "$_d/template" ] || continue
-            _n=${_d%/}; _n=${_n##*/}
+        for _t in "$_r"/*/template "$_r"/*/*/template "$_r"/*/*/*/template; do
+            [ -f "$_t" ] || continue
+            _n=${_t%/template}; _n=${_n##*/}
             # shellcheck disable=SC2254
             case $_n in $1|*$1*) printf '%s\t%s\n' "$_n" "$_r" ;; esac
         done

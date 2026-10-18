@@ -237,9 +237,13 @@ repo_list() {
 }
 
 # print the directory holding <pkg>s template honoring repo order
+# a repo can be flat (repo/pkg) or a ports tree up to two levels deep
+# (repo/category/pkg, repo/category/subcategory/pkg), shallowest wins
 pkg_find() {
     for _r in $BPM_REPOS; do
-        if [ -f "$_r/$1/template" ]; then printf '%s\n' "$_r/$1"; return 0; fi
+        for _pft in "$_r/$1/template" "$_r"/*/"$1"/template "$_r"/*/*/"$1"/template; do
+            if [ -f "$_pft" ]; then printf '%s\n' "${_pft%/template}"; return 0; fi
+        done
     done
     return 1
 }
