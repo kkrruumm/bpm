@@ -146,6 +146,8 @@ write_db() {
     # one per line, this is a correction for the way depends get listed
     # in package templates
     (set -f; for _dd in ${depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/depends"
+    (set -f; for _dd in ${use_depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/use_depends"
+    [ -s "$_d/use_depends" ] || rm -f "$_d/use_depends"
     acct_records > "$_d/accounts"
     [ -s "$_d/accounts" ] || rm -f "$_d/accounts"
     sums_create > "$_d/sums"

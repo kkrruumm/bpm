@@ -300,6 +300,23 @@ use_effective() {
     printf '%s\n' "${__ue# }"
 }
 
+# use_depends="llvm:all-targets" in a package means it needs llvm
+# built with all-targets
+# this just warns the user, nothing gets enabled automatically
+usedep_check() {
+    _uc=$1; shift
+    for _ud; do
+        _udp=${_ud%%:*} _udf=${_ud#*:}
+        case " ${_udwarned:-} " in *" $_uc>$_ud "*) continue ;; esac
+        pkg_find "$_udp" >/dev/null || continue
+        _ude=$( tmpl_load "$_udp" >/dev/null; use_effective )
+        case " $_ude " in *" $_udf "*) continue ;; esac
+        _udwarned="${_udwarned:-} $_uc>$_ud"
+        warn "$_uc needs $_udp built with use flag '$_udf'
+    add '$_udp $_udf' to $BPM_USECONF"
+    done
+}
+
 # package templates
 
 TMPL_VARS='pkg_name version revision short_desc maintainer license home_page
@@ -309,7 +326,7 @@ TMPL_VARS='pkg_name version revision short_desc maintainer license home_page
  cargo_args cargo_install_path gem_spec stackage
  go_import_path go_package go_build_tags go_ldflags go_mod_mode
  dist_files checksum skip_extract wrk_src build_wrk_src create_wrk_src patch_args
- depends make_depends conflicts provides
+ depends make_depends use_depends conflicts provides
  use_flags allow_network no_strip keep_libtool
  system_accounts system_groups config_files'
 

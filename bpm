@@ -199,6 +199,7 @@ cmd_build() {
     [ $# -gt 0 ] || usage
     _order=$(deps_order "$@")
     msg "build order: $_order"
+    for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
     _fetch=$(fetch_targets $_order) || exit 1
     # shellcheck disable=SC2086
     prefetch $_fetch
@@ -218,6 +219,7 @@ cmd_install() {
     done
     _order=$(deps_order "$@")
     msg "install order: $_order"
+    for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
     _fetch=$(fetch_targets $_order) || exit 1
     # shellcheck disable=SC2086
     prefetch $_fetch
@@ -367,6 +369,7 @@ cmd_update() {
             warn "$_p: no longer in any repository"
             continue
         fi
+        if [ -f "$_d/use_depends" ]; then usedep_check "$_p" $(cat "$_d/use_depends"); fi
         _oldv=$(cat "$_d/version")
         _oldu=$(cat "$_d/use" 2>/dev/null || echo)
         tmpl_load "$_p"
@@ -460,6 +463,7 @@ cmd_query() {
     _qf license "${license:-}"
     _qf depends "${depends:-}"
     _qf makedepends "${make_depends:-}"
+    _qf use_depends "${use_depends:-}"
     _qf use_flags "${use_flags:-}"
     _qf use "$(use_effective)"
     if [ -n "${system_accounts:-}${system_groups:-}" ]; then
