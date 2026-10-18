@@ -195,8 +195,23 @@ build_one() {
     [ "$_st" = 0 ] || die "$pkg_name: build failed, full log in $_log"
 }
 
+# bpm should be up to date before anything else happens as a bit of a safety net
+# unless bpm is pinned, only bpm itself is allowed to install/update while its out of date
+self_check() {
+    pkg_installed bpm && pkg_find bpm >/dev/null || return 0
+    pkg_pinned bpm && return 0
+    _sv=$(tmpl_get bpm pkg_ver)
+    [ "$(cat "$BPM_DB/bpm/version")" != "${_sv% }" ] || return 0
+    _sc=" $(rdeps_closure bpm) "
+    for _p; do
+        case $_sc in *" $_p "*) ;; *) die "bpm is out of date ($(cat "$BPM_DB/bpm/version") -> ${_sv% }), update it first with:
+        bpm update" ;; esac
+    done
+}
+
 cmd_build() {
     [ $# -gt 0 ] || usage
+    self_check "$@"
     _order=$(deps_order "$@")
     msg "build order: $_order"
     for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
@@ -208,6 +223,7 @@ cmd_build() {
 
 cmd_install() {
     [ $# -gt 0 ] || usage
+    self_check "$@"
     # deps order wont install a package that's already installed
     # so ez hack is to just treat a pinned package like its already installed
     for _p; do
