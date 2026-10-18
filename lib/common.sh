@@ -312,7 +312,7 @@ usedep_check() {
         _ude=$( tmpl_load "$_udp" >/dev/null; use_effective )
         case " $_ude " in *" $_udf "*) continue ;; esac
         _udwarned="${_udwarned:-} $_uc>$_ud"
-        warn "$_uc needs $_udp built with use flag '$_udf'
+        die "$_uc needs $_udp built with use flag '$_udf'
     add '$_udp $_udf' to $BPM_USECONF"
     done
 }
