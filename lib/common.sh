@@ -430,6 +430,10 @@ ar_current() {
       [ "$_ac" = "$(use_effective)" ] )
 }
 
+# builds run with LC_ALL=C and libarchive takes issue with this
+# this doesnt do anything with gtar or busybox tar
+tar() { LC_ALL=C.UTF-8 command tar "$@"; }
+
 # filters on stdin/stdout, selected by file extension, so there's not a dependency on
 # tars -a/-J/-z or on any particular tar implementation
 
