@@ -223,6 +223,11 @@ build_run() {
         esac
     fi
 
+    # precedence everywhere: template do_* > style_* > bpms default
+    if have do_extract; then do_extract
+    elif have style_extract; then style_extract
+    else extract; fi
+
     # archives don't always unpack "cleanly" if they'renamed after a tag or commit
     # if the expected directory isn't here but the archive created exactly one of its
     # own, use that instead
@@ -237,11 +242,6 @@ build_run() {
             sub "wrk_src: $wrk_src"
         fi
     fi
-
-    # precedence everywhere: template do_* > style_* > bpms default
-    if have do_extract; then do_extract
-    elif have style_extract; then style_extract
-    else extract; fi
 
     cd "$build_dir/$wrk_src" 2>/dev/null || cd "$build_dir"
     if have do_patch; then do_patch
