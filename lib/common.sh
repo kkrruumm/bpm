@@ -537,6 +537,10 @@ src_verify() {
     done
 }
 
+# see self_check, set to " <pkg> ... " while bpm's update has to skip the build root
+BPM_BOOTSTRAP=
+bootstrapping() { case $BPM_BOOTSTRAP in *" $1 "*) return 0 ;; esac; return 1; }
+
 # every package a resolved build order is actually going to build
 # this is what gets fetched and what the user is shown so it should
 # match build_one or the output lies about what's going to happen (nothing)

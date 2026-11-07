@@ -111,14 +111,17 @@ sandbox() {
 # one has to exist as a binary package first, which shouldn't be an issue because
 # in theory the system bpm is run against was built off of a basix tarball with the
 # base system already built, so missing a base package is a hard error
+broot_base_missing() {
+    # shellcheck disable=SC2086
+    for _bm in $(rdeps_closure $BPM_BASEPKGS); do
+        ar_current "$_bm" || printf ' %s' "$_bm"
+    done
+}
+
 broot_require_base() {
     [ -n "$BPM_BASEPKGS" ] ||
         die "BPM_BUILDROOT is set but BPM_BASEPKGS is empty, nothing to build in"
-    _miss=
-    # shellcheck disable=SC2086
-    for _bm in $(rdeps_closure $BPM_BASEPKGS); do
-        ar_current "$_bm" || _miss="$_miss $_bm"
-    done
+    _miss=$(broot_base_missing)
     [ -z "$_miss" ] || die "no current binary package for build root base:$_miss
     these have to be built against the host once, e.g.:
         BPM_BUILDROOT= bpm build$_miss"
@@ -164,18 +167,31 @@ host_require_makedeps() {
 }
 
 plan_check() {
-    [ $# -gt 0 ] || return 0
-    if [ -n "$BPM_BUILDROOT" ]; then
-        broot_require_base
-    else
-        for _pc in "$@"; do host_require_makedeps "$_pc"; done
-    fi
+    _pc_base=0
+    for _pc; do
+        if [ -n "$BPM_BUILDROOT" ] && ! bootstrapping "$_pc"; then
+            [ "$_pc_base" = 1 ] || broot_require_base
+            _pc_base=1
+        else
+            host_require_makedeps "$_pc"
+        fi
+    done
 }
 
 build_one() {
     if [ "$BPM_FORCE" = 0 ] && ar_current "$1"; then
         tmpl_load "$1"
         sub "$pkg_name-$pkg_ver is already built"
+        return 0
+    fi
+    
+    # look at self_check too, BPM_BUILDROOT is exported so emptying it here
+    # sends the __stage to the host too
+    if [ -n "$BPM_BUILDROOT" ] && bootstrapping "$1"; then
+        _bo_br=$BPM_BUILDROOT
+        BPM_BUILDROOT=
+        build_one "$1"
+        BPM_BUILDROOT=$_bo_br
         return 0
     fi
 
@@ -209,16 +225,28 @@ build_one() {
 
 # bpm should be up to date before anything else happens as a bit of a safety net
 # unless bpm is pinned, only bpm itself is allowed to install/update while its out of date
-self_check() {
-    pkg_installed bpm && pkg_find bpm >/dev/null || return 0
-    pkg_pinned bpm && return 0
+bpm_outdated() {
+    pkg_installed bpm && pkg_find bpm >/dev/null || return 1
+    pkg_pinned bpm && return 1
     _sv=$(tmpl_get bpm pkg_ver)
-    [ "$(cat "$BPM_DB/bpm/version")" != "${_sv% }" ] || return 0
+    [ "$(cat "$BPM_DB/bpm/version")" != "${_sv% }" ]
+}
+
+# on a fresh install from a basix tarball the buildroot hasnt been built yet
+# so while the base is missing whatever bpm needs to update *itself* is built
+# against the host
+self_check() {
+    bpm_outdated || return 0
     _sc=" $(rdeps_closure bpm) "
     for _p; do
         case $_sc in *" $_p "*) ;; *) die "bpm is out of date ($(cat "$BPM_DB/bpm/version") -> ${_sv% }), update it first with:
         bpm update" ;; esac
     done
+    if [ -n "$BPM_BUILDROOT" ] && [ -n "$BPM_BASEPKGS" ] &&
+       [ -n "$(broot_base_missing)" ]; then
+        BPM_BOOTSTRAP=$_sc
+        warn "the build root base isn't built yet, building bpm's update against the host"
+    fi
 }
 
 cmd_build() {
@@ -449,6 +477,27 @@ cmd_update() {
     # an update isnt a request for any of these, a package that got pulled as a dep
     # stays a dep after it's rebuilt
     BPM_MARK=keep
+
+    # self_check would finger wag at the whole set so bpm and what it needs goes first
+    # the rest is for the new bpm
+    if bpm_outdated; then
+        _sc=" $(rdeps_closure bpm) " _self= _rest=
+        for _p in $_out; do
+            case $_sc in *" $_p "*) _self="$_self $_p" ;; *) _rest="$_rest $_p" ;; esac
+        done
+        if [ -n "$_rest" ]; then
+            msg "bpm is out of date, updating it before anything else"
+            # shellcheck disable=SC2086
+            cmd_install $_uyes $_self
+            BPM_MARK=explicit
+            # still outdated means the prompt was declined
+            if bpm_outdated; then return 0; fi
+            msg "continuing the update with the new bpm"
+            # shellcheck disable=SC2086
+            exec "$BPM_SELF" update $_uyes
+        fi
+    fi
+
     # shellcheck disable=SC2086
     cmd_install $_uyes $_out
     BPM_MARK=explicit
