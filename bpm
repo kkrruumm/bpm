@@ -38,12 +38,14 @@ bpm $BPM_PROGVER - basix package manager
 usage: bpm <command> [argument ...]
 
   [b]uild    pkg...   build packages and any missing dependencies
-  [i]nstall  pkg...   build if needed, then install into \$BPM_ROOT
+  [i]nstall  pkg...   build if needed, then install into \$BPM_ROOT,
+                      -y skips the prompt
   [r]emove   pkg...   remove installed packages, -a also removes the orphans
                       that leaves behind, -f skips the reverse dependency check
   autoremove          remove every orphaned package, -n lists them instead,
                       -y skips the prompt
-  [u]pdate            pull repositories, rebuild and install what changed
+  [u]pdate            pull repositories, rebuild and install what changed,
+                      -y skips the prompt
   pin        [pkg...] pin packages at their installed version, no args
                       lists what is pinned
   unpin      pkg...   release the pin
@@ -161,7 +163,22 @@ host_require_makedeps() {
         bpm install$_miss"
 }
 
+plan_check() {
+    [ $# -gt 0 ] || return 0
+    if [ -n "$BPM_BUILDROOT" ]; then
+        broot_require_base
+    else
+        for _pc in "$@"; do host_require_makedeps "$_pc"; done
+    fi
+}
+
 build_one() {
+    if [ "$BPM_FORCE" = 0 ] && ar_current "$1"; then
+        tmpl_load "$1"
+        sub "$pkg_name-$pkg_ver is already built"
+        return 0
+    fi
+
     if [ -n "$BPM_BUILDROOT" ]; then
         broot_prebuild "$1"
     else
@@ -169,14 +186,9 @@ build_one() {
     fi
 
     tmpl_load "$1"
+    # the archive records the flags it was built with, so a use flag
+    # change invalidates it just like a version bump does
     if [ -f "$pkg_ar" ] && [ "$BPM_FORCE" = 0 ]; then
-        # the archive records the flags it was built with, so a use flag
-        # change invalidates it just like a version bump does
-        _was=$(ar_member "$pkg_ar" "./var/db/bpm/installed/$pkg_name/use" 2>/dev/null || echo)
-        if [ "$_was" = "$(use_effective)" ]; then
-            sub "$pkg_name-$pkg_ver is already built"
-            return 0
-        fi
         sub "$pkg_name: use flags changed to \"$(use_effective)\", rebuilding"
     fi
     # sources were fetched by prefetch outside the sandbox since it probably
@@ -213,15 +225,28 @@ cmd_build() {
     [ $# -gt 0 ] || usage
     self_check "$@"
     _order=$(deps_order "$@")
-    msg "build order: $_order"
     for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
-    _fetch=$(fetch_targets $_order) || exit 1
+    _plan=$(build_plan $_order) || exit 1
     # shellcheck disable=SC2086
-    prefetch $_fetch
+    plan_check $_plan
+    # shellcheck disable=SC2086
+    show_builds "$*" "$_order" $_plan
+    # shellcheck disable=SC2086
+    prefetch $_plan
     for _p in $_order; do build_one "$_p"; done
 }
 
 cmd_install() {
+    _yes=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -y|--yes) _yes=1 ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1 (try 'bpm help')" ;;
+            *) break ;;
+        esac
+        shift
+    done
     [ $# -gt 0 ] || usage
     self_check "$@"
     # deps order wont install a package that's already installed
@@ -234,11 +259,22 @@ cmd_install() {
         fi
     done
     _order=$(deps_order "$@")
-    msg "install order: $_order"
     for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
-    _fetch=$(fetch_targets $_order) || exit 1
+    _plan=$(build_plan $_order) || exit 1
     # shellcheck disable=SC2086
-    prefetch $_fetch
+    plan_check $_plan
+    # shellcheck disable=SC2086
+    show_builds "$*" "$_order" $_plan
+    # shellcheck disable=SC2086
+    show_installs "$*" $_order
+
+    if [ "$_yes" = 0 ] && ! confirm "proceed?" "proceed"; then
+        msg "nothing installed"
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    prefetch $_plan
     for _p in $_order; do build_one "$_p"; done
 
     # what the user entered is explicit, whatever deps_order appended isnt
@@ -342,14 +378,9 @@ cmd_autoremove() {
 
     # the remove list bpm decides on isn't explicitly entered by the user
     # so this requires confirmation from the user unless -y
-    if [ "$_yes" = 0 ]; then
-        [ -t 0 ] || die "not a terminal, pass -y to remove these"
-        printf 'remove these? [y/N] ' >&2
-        read -r _a || _a=
-        case $_a in
-            y|Y|yes|YES) ;;
-            *) msg "nothing removed"; return 0 ;;
-        esac
+    if [ "$_yes" = 0 ] && ! confirm "remove these?" "remove these"; then
+        msg "nothing removed"
+        return 0
     fi
 
     # shellcheck disable=SC2086
@@ -376,6 +407,17 @@ cmd_pull() {
 }
 
 cmd_update() {
+    _uyes=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -y|--yes) _uyes=-y ;;
+            --) shift; break ;;
+            -*) die "unknown option: $1 (try 'bpm help')" ;;
+            *) break ;;
+        esac
+        shift
+    done
+    [ $# -eq 0 ] || die "update takes no package arguments (try 'bpm help')"
     cmd_pull
     _out= _held=
     for _d in "$BPM_DB"/*/; do
@@ -408,7 +450,7 @@ cmd_update() {
     # stays a dep after it's rebuilt
     BPM_MARK=keep
     # shellcheck disable=SC2086
-    cmd_install $_out
+    cmd_install $_uyes $_out
     BPM_MARK=explicit
 }
 

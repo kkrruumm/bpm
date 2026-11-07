@@ -537,28 +537,74 @@ src_verify() {
     done
 }
 
-# every package a resolved build order will try to build plus with a build root
-# the make_depends and broot_prebuild builds for them
-fetch_targets() {
-    _ft_seen=' ' _ft_out=
-    for _ftp; do
-        if [ "$BPM_FORCE" = 1 ] || ! ar_current "$_ftp"; then fetch_walk "$_ftp"; fi
-    done
-    printf '%s\n' "${_ft_out# }"
+# every package a resolved build order is actually going to build
+# this is what gets fetched and what the user is shown so it should
+# match build_one or the output lies about what's going to happen (nothing)
+build_plan() {
+    _bp_seen=' ' _bp_out=
+    for _bpp; do plan_walk "$_bpp" top; done
+    printf '%s\n' "${_bp_out# }"
 }
 
-fetch_walk() {
-    case $_ft_seen in *" $1 "*) return 0 ;; esac
-    _ft_seen="$_ft_seen$1 "
-    _ft_out="$_ft_out $1"
-    [ -n "$BPM_BUILDROOT" ] || return 0
-    _ftm=$(tmpl_get "$1" make_depends)
-    for _ftd in $_ftm; do pkg_need "$_ftd" "$1"; done
-    # shellcheck disable=SC2086
-    _ftc=$(rdeps_closure $_ftm) || exit 1
-    for _ftd in $_ftc; do
-        ar_current "$_ftd" || fetch_walk "$_ftd"
+plan_walk() {
+    case $_bp_seen in *" $1 "*) return 0 ;; esac
+    _bp_seen="$_bp_seen$1 "
+    if [ "$BPM_FORCE" = 0 ] || [ "$2" = dep ]; then
+        if ar_current "$1"; then return 0; fi
+    fi
+    if [ -n "$BPM_BUILDROOT" ]; then
+        _bpm=$(tmpl_get "$1" make_depends)
+        for _bpd in $_bpm; do pkg_need "$_bpd" "$1"; done
+        # shellcheck disable=SC2086
+        _bpc=$(rdeps_closure $_bpm) || exit 1
+        for _bpd in $_bpc; do plan_walk "$_bpd" dep; done
+    fi
+    _bp_out="$_bp_out $1"
+}
+
+# show_builds "<named>" "<install order>" <plan...>
+show_builds() {
+    _sb_named=" $1 " _sb_order=" $2 "; shift 2
+    if [ $# -eq 0 ]; then msg "nothing to build"; return 0; fi
+    msg "$# package(s) to build:"
+    for _sbp; do
+        _sbv=$(tmpl_get "$_sbp" pkg_ver)
+        case $_sb_named in
+            *" $_sbp "*) _sbw= ;;
+            *) case $_sb_order in
+                   *" $_sbp "*) _sbw=' (dependency)' ;;
+                   *) _sbw=' (make dependency, not installed)' ;;
+               esac ;;
+        esac
+        sub "$_sbp ${_sbv% }$_sbw"
     done
+}
+
+# show_installs "<named>" <install order...>
+show_installs() {
+    _si_named=" $1 "; shift
+    msg "$# package(s) to install:"
+    for _sip; do
+        _siv=$(tmpl_get "$_sip" pkg_ver); _siv=${_siv% }
+        if pkg_installed "$_sip"; then
+            _sio=$(cat "$BPM_DB/$_sip/version")
+            if [ "$_sio" = "$_siv" ]; then _siv="$_siv (reinstall)"
+            else _siv="$_sio -> $_siv"; fi
+        fi
+        case $_si_named in *" $_sip "*) ;; *) _siv="$_siv (dependency)" ;; esac
+        sub "$_sip $_siv"
+    done
+}
+
+# confirm "<question>" "<what -y does>"
+confirm() {
+    [ -t 0 ] || die "not a terminal, pass -y to $2"
+    printf '%s [y/N] ' "$1" >&2
+    read -r _cf_a || _cf_a=
+    case $_cf_a in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # prefetch <pkg> - fetch and verify sources BPM_FETCH_JOBS packages at a time,
