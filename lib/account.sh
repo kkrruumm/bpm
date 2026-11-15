@@ -1,168 +1,194 @@
 # bpm system account handling
-# prepare for a fucking mess
+# this script is a tad annoying to read, tried my best to comment it though
 #
-# a template might declare the following:
+# a template can specify the following:
+#   system_accounts="messagebus"
+#   messagebus_uid=22
+#   messagebus_gid=22
+#   messagebus_descr="D-Bus system message bus"
+#   messagebus_homedir="/var/lib/dbus"
+#   messagebus_shell="/bin/false"
+#   messagebus_groups="audio video"
+#   ...for example.
 #
-#     system_accounts="messagebus"
-#     messagebus_uid=22
-#     messagebus_gid=22
-#     messagebus_descr="D-Bus system message bus"
-#     messagebus_homedir="/var/lib/dbus"
-#     messagebus_shell="/bin/false"
-#     messagebus_groups="audio video"
+#   to specify a group with no account, one may:
+#   system_groups="plugdev"
 #
-# and for a group with no account behind it, system_groups="plugdev"
-#
-# everything else does what it says on the tin
+# this all gets recorded in the packages database entry as:
+#   user:<name>:<uid>:<gid>:<descr>:<home>:<shell>:<extra,groups>
+#   group:<name>:<gid>
+# where an id of - means allocate one
 
 acct_name_ok() {
     case $1 in
-        ''|-*|*[!A-Za-z0-9_-]*) return 1 ;;
+        '')
+            return 1
+        ;;
+
+        -*)
+            return 1
+        ;;
+
+        *[!A-Za-z0-9_-]*)
+            # at least one character outside of the allowed set
+            # this also catches spaces, newlines, globs, quotes, '/', etc
+            return 1
+        ;;
     esac
+
+    return 0
 }
 
-# the records stored in the packages db entry and read back at install time
-#     user:<name>:<uid>:<gid>:<descr>:<home>:<shell>:<extra groups>
-#     group:<name>:<gid>
-# a - in an id field means allocate one
-acct_records() {
-    for _a in ${system_groups:-}; do
-        acct_name_ok "$_a" || die "system_groups: bad group name '$_a'"
-        eval "_ag=\${${_a}_gid:--}"
-        printf 'group:%s:%s\n' "$_a" "$_ag"
+# build side, this bit runs with the template loaded
+# oo spooky evals time
+#
+# () on purpose: this runs in the build stage alongside the template, so acct,
+# uid, gid, home, shell and the rest must not stay set in that shell
+acct_records() (
+    for acct in ${system_groups:-}; do
+        acct_name_ok "$acct" || die "system_groups: bad group name '$acct'"
+        eval "gid=\${${acct}_gid:--}" # spit out like gid=1001 with name_gid=1001 for example
+        printf 'group:%s:%s\n' "$acct" "$gid" # will output like group:name:1001 with alice_gid=1001
     done
-    for _a in ${system_accounts:-}; do
-        acct_name_ok "$_a" || die "system_accounts: bad account name '$_a'"
-        eval "_au=\${${_a}_uid:--}"
-        eval "_ag=\${${_a}_gid:--}"
-        eval "_ad=\${${_a}_descr:-\$_a}"
-        eval "_ah=\${${_a}_homedir:-/var/empty}"
-        eval "_as=\${${_a}_shell:-/bin/false}"
-        eval "_ax=\${${_a}_groups:-}"
-        case $_ad$_ah$_as$_ax in
-            *:*) die "$_a: ':' cannot appear in a system_accounts field" ;;
+
+    for acct in ${system_accounts:-}; do
+        acct_name_ok "$acct" || die "system_accounts: bad account name '$acct'"
+        eval "uid=\${${acct}_uid:--} gid=\${${acct}_gid:--}" # same type of indirect expansion as in the above loop
+        eval "descr=\${${acct}_descr:-\$acct} home=\${${acct}_homedir:-/var/empty}"
+        eval "shell=\${${acct}_shell:-/bin/false} groups=\${${acct}_groups:-}"
+
+        # this is handled like this because posix shell
+        # doesnt allow for wildcards otherwise
+        case $descr$home$shell$groups in
+            *:*) die "$acct: ':' cannot appear in a system_accounts field" ;;
         esac
-        printf 'user:%s:%s:%s:%s:%s:%s:%s\n' "$_a" "$_au" "$_ag" \
-            "$_ad" "$_ah" "$_as" "$(printf '%s' "$_ax" | tr ' ' ',')"
+
+        # globbing has to be off for this or something like * (lol) would be
+        # replaced by filenames in the current dir
+        #
+        # if you're not super familiar with shell, set -- $groups then expands
+        # the parts of $groups into arguments, so like $1 = wheel, $2 = audio for example
+        set -f; set -- $groups; set +f
+        groups=$(IFS=,; printf '%s' "$*")
+        printf 'user:%s:%s:%s:%s:%s:%s:%s\n' "$acct" "$uid" "$gid" "$descr" "$home" "$shell" "$groups"
     done
-}
+)
 
 # install side
+# inlining awk for this stuff *is* a bit slower
+# but for the sake of readability it's probably for the best
+#
+# a lot of these functions use () instead of {} intentionally
+# so their body is run in a subshell which keeps their stuff local
+# to that subshell
 
-# does <value> appear in field <n> of etc/<file>
-acct_has() {
-    _f=$BPM_ROOT/etc/$1
-    [ -f "$_f" ] || return 1
-    cut -d: -f"$2" "$_f" | grep -qxF -- "$3"
-}
+# field <file> <n> <value> - etc/<file> has <value> in field <n> of some line
+# field <file> <n> <value> <m> - and prints field <m> of that line
+acct_field() (
+    [ -f "${BPM_ROOT}/etc/${1}" ] || return 1
+    awk -F: -v n="$2" -v value="$3" -v m="${4:-0}" '
+        $n == value { found = 1; if (m) print $m; exit }
+        END { exit !found }' "${BPM_ROOT}/etc/${1}"
+)
 
-acct_user_exists() { acct_has passwd 1 "$1"; }
-acct_group_exists() { acct_has group  1 "$1"; }
-acct_uid_taken() { acct_has passwd 3 "$1"; }
-acct_gid_taken() { acct_has group  3 "$1"; }
+# the lowest id free as a uid and gid, new accounts usually get uid = gid
+acct_free_id() (
+    cat "${BPM_ROOT}/etc/passwd" "${BPM_ROOT}/etc/group" 2>/dev/null |
+        awk -F: -v min="${BPM_SYSID_MIN:-100}" -v max="${BPM_SYSID_MAX:-999}" '
+           { taken[$3] }
+            END { for (id = min; id <= max; id++) if (!(id in taken)) { print id; exit 0 }; exit 1 }' ||
+            die "no free system id left in ${BPM_SYSID_MIN:-100}..${BPM_SYSID_MAX:-999}"
+)
 
-# name holding <id> in etc/<file>, this is for error messages
-acct_id_owner() {
-    _f=$BPM_ROOT/etc/$1
-    [ -f "$_f" ] || return 0
-    grep "^[^:]*:[^:]*:$2:" "$_f" | cut -d: -f1 | head -n1
-}
-
-acct_gid_of() {
-    grep "^$1:" "$BPM_ROOT/etc/group" | cut -d: -f3 | head -n1
-}
-
-# lowest id free on both sides so a new account can usually have uid = gid
-acct_free_id() {
-    _i=${BPM_SYSID_MIN:-100} _max=${BPM_SYSID_MAX:-999}
-    while [ "$_i" -le "$_max" ]; do
-        if ! acct_uid_taken "$_i" && ! acct_gid_taken "$_i"; then
-            printf '%s\n' "$_i"
-            return 0
-        fi
-        _i=$((_i + 1))
-    done
-    die "no free system id left in ${BPM_SYSID_MIN:-100}..$_max"
-}
-
-# create <name> with <gid> or with an allocated one
-# leaves the id it landed on in _acct_gid
+# group_create <name> <gid|-> - leaves the gid it wound up with in group_gid
 group_create() {
-    _gn=$1 _gg=$2
-    if acct_group_exists "$_gn"; then
-        _acct_gid=$(acct_gid_of "$_gn")
-        return 0
+    group_gid=$(acct_field group 1 "$1" 3) && return 0
+    group_gid=$2
+
+    if [ "$group_gid" = - ]; then
+        group_gid=$(acct_free_id) # grab a free ID
+    elif acct_field group 3 "$group_gid" >/dev/null; then
+        die "group $1: gid $group_gid already belongs to $(acct_field group 3 "$group_gid" 1)"
     fi
-    if [ "$_gg" = - ]; then
-        _gg=$(acct_free_id)
-    elif acct_gid_taken "$_gg"; then
-        die "group $_gn: gid $_gg already belongs to $(acct_id_owner group "$_gg")"
-    fi
-    mkdir -p "$BPM_ROOT/etc"
-    printf '%s:x:%s:\n' "$_gn" "$_gg" >> "$BPM_ROOT/etc/group"
-    [ ! -f "$BPM_ROOT/etc/gshadow" ] ||
-        printf '%s:!::\n' "$_gn" >> "$BPM_ROOT/etc/gshadow"
-    sub "group $_gn ($_gg)"
-    _acct_gid=$_gg
+
+    mkdir -p "${BPM_ROOT}/etc"
+    printf '%s:x:%s:\n' "$1" "$group_gid" >> "${BPM_ROOT}/etc/group"
+
+    [ -f "${BPM_ROOT}/etc/gshadow" ] &&
+        printf '%s:!::\n' "$1" >> "${BPM_ROOT}/etc/gshadow"
+
+    # also what keeps a missing gshadow from becoming this function's status;
+    # group_gid stays set, it's what the caller reads
+    sub "group $1 ($group_gid)"
 }
 
-# add <user> to supplementary <group>
+# group_add_member <user> <group>
 group_add_member() {
-    _f=$BPM_ROOT/etc/group
-    if ! acct_group_exists "$2"; then
-        warn "$1: no group '$2' to join"
-        return 0
-    fi
-    _mem=$(grep "^$2:" "$_f" | cut -d: -f4 | head -n1)
-    case ",$_mem," in
-        *",$1,"*) return 0 ;;
-    esac
-    if [ -n "$_mem" ]; then _mem=$_mem,$1; else _mem=$1; fi
-    # rewritten through cat so the files mode and owner survive
-    # this is a stupid ass hack but its "clean" so fuck it
-    sed "s|^\($2:[^:]*:[^:]*:\).*|\1$_mem|" "$_f" > "$_f.bpm" && cat "$_f.bpm" > "$_f"
-    rm -f "$_f.bpm"
+    ! acct_field group 1 "$2" >/dev/null &&
+        { warn "$1: no group '$2' to join"; return 0; }
+
+    group_file=$BPM_ROOT/etc/group
+    awk -F: -v OFS=: -v user="$1" -v group="$2" '
+        $1 == group && index("," $4 ",", "," user ",") == 0 { $4 = ($4 == "" ? user : $4 "," user) }
+        { print }' "$group_file" > "$group_file.bpm"
+
+    # this is rewritten specifically with > so the file keeps its owner and mode
+    cat "$group_file.bpm" > "$group_file"; rm -f "$group_file.bpm"
+    unset group_file
 }
 
 user_create() {
-    _un=$1 _uu=$2 _ug=$3 _ud=$4 _uh=$5 _us=$6 _ux=$7
+    user=$1 uid=$2 gid=$3 descr=$4 home=$5 shell=$6 groups=$7
+    acct_field passwd 1 "$user" >/dev/null && return 0
 
-    if acct_user_exists "$_un"; then return 0; fi
-
-    # a pinned id is a promise and a clash is fatal, a mirrored one is only a
-    # preference and quietly gives way
-    if [ "$_ug" = - ]; then
-        if [ "$_uu" != - ] && ! acct_gid_taken "$_uu"; then _ug=$_uu; else _ug=$(acct_free_id); fi
+    if [ "$gid" = - ]; then
+        if [ "$uid" != - ] && ! acct_field group 3 "$uid" > /dev/null; then
+            gid=$uid
+        else
+            gid=$(acct_free_id)
+        fi
     fi
-    group_create "$_un" "$_ug"
-    _ug=$_acct_gid
+    group_create "$user" "$gid"
+    gid=$group_gid
 
-    if [ "$_uu" = - ]; then
-        if acct_uid_taken "$_ug"; then _uu=$(acct_free_id); else _uu=$_ug; fi
-    elif acct_uid_taken "$_uu"; then
-        die "$_un: uid $_uu already belongs to $(acct_id_owner passwd "$_uu")"
+    if [ "$uid" = - ]; then
+        if acct_field passwd 3 "$gid" >/dev/null; then
+            uid=$(acct_free_id)
+        else
+            uid=$gid
+        fi
+    elif acct_field passwd 3 "$uid" >/dev/null; then
+        die "$user: uid $uid already belongs to $(acct_field passwd 3 "$uid" 1)"
     fi
 
-    mkdir -p "$BPM_ROOT/etc"
-    printf '%s:x:%s:%s:%s:%s:%s\n' "$_un" "$_uu" "$_ug" "$_ud" "$_uh" "$_us" \
-        >> "$BPM_ROOT/etc/passwd"
-    # ! is not a valid hash so nothing will ever authenticate as this account
-    [ ! -f "$BPM_ROOT/etc/shadow" ] ||
-        printf '%s:!:%s::::::\n' "$_un" "$(( $(date +%s) / 86400 ))" \
-            >> "$BPM_ROOT/etc/shadow"
+    mkdir -p "${BPM_ROOT}/etc"
+    printf '%s:x:%s:%s:%s:%s:%s\n' "$user" "$uid" "$gid" "$descr" "$home" "$shell" >> "$BPM_ROOT/etc/passwd"
 
-    for _g in $(printf '%s' "$_ux" | tr ',' ' '); do group_add_member "$_un" "$_g"; done
-    sub "account $_un ($_uu:$_ug)"
+    # ! isn't supposed to be a valid hash, nothing will ever auth as this account
+    # in theory, unless someone makes another stinky
+    [ -f "${BPM_ROOT}/etc/shadow" ] &&
+        printf '%s:!:%s::::::\n' "$user" "$(( $(date +%s) / 86400 ))" >> "$BPM_ROOT/etc/shadow"
+
+    saved_ifs=$IFS; IFS=,; set -f
+    set -- $groups
+    IFS=$saved_ifs; set +f
+
+    for group; do
+        group_add_member "$user" "$group"
+    done
+
+    sub "account $user ($uid:$gid)"
+    unset user uid gid descr home shell groups saved_ifs group group_gid
 }
 
-accounts_apply() {
+accounts_apply() (
     [ -s "$1" ] || return 0
-    while IFS=: read -r _t _n _r1 _r2 _r3 _r4 _r5 _r6; do
-        case $_t in
-            user) user_create "$_n" "$_r1" "$_r2" "$_r3" "$_r4" "$_r5" "$_r6" ;;
-            group) group_create "$_n" "$_r1" ;;
-            ''|\#*) : ;;
-            *) warn "unrecognised account record '$_t'" ;;
+    while IFS=: read -r kind name f1 f2 f3 f4 f5 f6; do
+        case $kind in
+            user) user_create "$name" "$f1" "$f2" "$f3" "$f4" "$f5" "$f6" ;;
+            group) group_create "$name" "$f1" ;;
+            ''|\#*) ;;
+            *) warn "unrecognised account record '$kind'" ;;
         esac
     done < "$1"
-}
+)

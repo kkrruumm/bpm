@@ -1,4 +1,10 @@
-# bpms build stage, runs inside the sandbox
+# bpms build stage, everything runs inside of the sandbox with the template loaded
+#
+# anything here that a template might call or that runs between template functions
+# keeps its vars under a __ prefix, templates freely use whatever vars in their own
+# functions and whatnot
+
+. "${BPM_LIBDIR}/account.sh"
 
 build_env() {
     DESTDIR=$dest_dir
@@ -6,207 +12,287 @@ build_env() {
     PATCHESDIR=$tmpl_dir/patches
     SOURCEDIR=$src_dir
     make_jobs=-j$BPM_JOBS
-    : "${make_cmd:=make}"
-    : "${CC:=cc}" ; : "${CXX:=c++}"
-    export DESTDIR FILESDIR PATCHESDIR SOURCEDIR CC CXX CFLAGS CXXFLAGS LDFLAGS
-    export MAKEFLAGS="$make_jobs"
-    export LC_ALL=C
-    export TMPDIR=/tmp
-    export pkg_name version revision
+    : "${make_cmd:=make}" "${CC:=cc}" "${CXX:=c++}"
+    MAKEFLAGS=$make_jobs LC_ALL=C TMPDIR=/tmp
+    export DESTDIR FILESDIR PATCHESDIR SOURCEDIR CC CXX CFLAGS CXXFLAGS LDFLAGS \
+        MAKEFLAGS LC_ALL TMPDIR pkg_name version revision
 }
 
-# build styles supply style_configure/style_build/style_check/style_install
-# a template's own do_* always wins, and pre_/post_ hooks always run
+# build styles provide style_<phase>, a templates own do_<phase> will always win though
+# pre_/post_ hooks always run
 style_load() {
-    case $build_style in
-        custom|"") return 0 ;;
-    esac
-    _s=$BPM_LIBDIR/style/$build_style.sh
-    [ -f "$_s" ] || die "unknown build_style: $build_style"
-    . "$_s"
+    case "$build_style" in custom|'') return 0 ;; esac # custom or unspecified means no style
+    [ -f "${BPM_LIBDIR}/style/${build_style}.sh" ] || die "unknown build_style: $build_style"
+    . "${BPM_LIBDIR}/style/${build_style}.sh" # these are just scripts that have functions
+}
+
+# step <name> <default> - do_<name> > style_<name> > the default, nothing if empty
+step() {
+    if have "do_${1}"; then
+        sub "$1"
+        "do_${1}"
+    elif have "style_${1}"; then
+        sub "$1"
+        "style_${1}"
+    elif [ -n "${2:-}" ]; then
+        "$2"
+    fi
 }
 
 phase() {
-    if have "pre_$1"; then sub "pre_$1"; "pre_$1";  fi
-    if have "do_$1"; then sub "$1"; "do_$1"
-    elif have "style_$1"; then sub "$1"; "style_$1"
-    fi
-    if have "post_$1"; then sub "post_$1"; "post_$1"; fi
+    have "pre_${1}" && {
+        sub "pre_${1}"
+        "pre_${1}"
+    }
+
+    step "$1"
+
+    have "post_${1}" && {
+        sub "post_${1}"
+        "post_${1}"
+    }
+
+    # no post_ hook isn't a failure, the && above would otherwise be the status
+    return 0
 }
 
-# source preparation shit
+# sources
 
-extract() {
-    if [ "${create_wrk_src:-no}" = yes ]; then mkdir -p "$build_dir/$wrk_src"; _into=$build_dir/$wrk_src
-    else _into=$build_dir; fi
-
-    for _d in ${dist_files:-}; do
-        _f=$src_dir/$(dist_name "$_d")
-        case ${skip_extract:-} in *"${_f##*/}"*) cp -f "$_f" "$_into"; continue ;; esac
-        case $_d in
-            git+*) cp -R "$_f" "$build_dir/$wrk_src" ; continue ;;
-        esac
-        sub "extract ${_f##*/}"
-        case $_f in
-            *.tar|*.tar.*|*.tgz|*.txz|*.tbz2)
-                decomp "$_f" < "$_f" | tar xf - -C "$_into" ;;
-            *.zip)
-                have unzip || die "unzip is required for ${_f##*/}"
-                unzip -qo "$_f" -d "$_into" ;;
-            *)
-                cp -f "$_f" "$_into" ;;
-        esac
-    done
-}
-
-apply_patches() {
-    [ -d "$PATCHESDIR" ] || return 0
-    # sorted across both extensions so patches come in the correct order
-    # patch names must not contain whitespace
-    _list=$(for _f in "$PATCHESDIR"/*.patch "$PATCHESDIR"/*.diff; do
-            if [ -f "$_f" ]; then printf '%s\n' "$_f"; fi
-        done | sort)
-    for _p in $_list; do
-        sub "patch ${_p##*/}"
-        patch ${patch_args:--p1} -i "$_p"
-    done
-}
-
-# bextract <distfile> [subdir] - place an already fetched distfile into the
-# build tree
-#
-# this is for packages that ship more than one archive or need one
-# unpacked somewhere other than the root of the source directory
-bextract() {
-    _bf=$src_dir/$1
-    [ -f "$_bf" ] || die "bextract: no such distfile: $1"
-    _bd=$build_dir${2:+/$2}
-    mkdir -p "$_bd"
-    case $_bf in
-        *.tar|*.tar.*|*.tgz|*.txz|*.tbz2)
-            decomp "$_bf" < "$_bf" | tar xf - -C "$_bd" ;;
-        *)
-            cp -f "$_bf" "$_bd" ;;
+# unpack <file> <dir> - archives are extracted, anything else gets copied
+unpack() {
+    mkdir -p "$2"
+    case $1 in
+        *.tar|*.tar.*|*.tgz|*.txz|*.tbz2) untar "$1" "$2" ;;
+        *.zip) have unzip || die "unzip is required for ${1##*/}"
+            unzip -qo "$1" -d "$2" ;;
+        *) cp -f "$1" "$2" ;;
     esac
 }
 
-# post processing shit
+extract() {
+    __into=$build_dir
+    [ "${create_wrk_src:-no}" = yes ] && {
+        __into=${build_dir}/${wrk_src}
+        mkdir -p "$__into"
+    }
+
+    for __dist in ${dist_files:-}; do
+        __file=$src_dir/$(dist_name "$__dist")
+
+        case ${skip_extract:-} in
+            *"${__file##*/}"*)
+                cp -f "$__file" "$__into"
+                continue
+            ;;
+        esac
+
+        case $__dist in
+            git+*)
+                cp -R "$__file" "${build_dir}/${wrk_src}"
+                continue
+            ;;
+        esac
+
+        sub "extract ${__file##*/}"
+        unpack "$__file" "$__into"
+    done
+    unset __into __dist __file
+}
+
+# bextract <distfile> [subdir] - put a fetched distfile into the build tree
+# this is for packages that have several archives or like, if one belongs
+# somewhere specific
+bextract() {
+    [ -f "${src_dir}/${1}" ] || die "bextract: no such distfile: $1"
+    __into=$build_dir${2:+/$2}
+
+    case $1 in
+        *.zip) 
+            mkdir -p "$__into"
+            cp -f "${src_dir}/${1}" "$__into"
+        ;;
+        *) unpack "${src_dir}/${1}" "$__into"
+        ;;
+    esac
+    unset __into
+}
+
+# patches/*.patch and *.diff applied in name order
+apply_patches() {
+    [ -d "$PATCHESDIR" ] || return 0
+
+    __patches=$(
+        for __p in "$PATCHESDIR"/*.patch "$PATCHESDIR"/*.diff; do
+            [ -f "$__p" ] && printf '%s\n' "$__p"
+        done | sort
+    )
+
+    for __patch in $__patches; do
+        sub "patch ${__patch##*/}"
+        patch ${patch_args:--p1} -i "$__patch"
+    done
+    unset __patches __patch
+}
+
+# an archive named after a tag or commit or some other bullshit probably
+# wont unpack into $wrk_src, if it made exactly one dir then thats probably it
+find_wrk_src() {
+    [ ! -d "${build_dir}/${wrk_src}" ] || return 0
+    set -- "$build_dir"/*/
+    if [ $# -eq 1 ] && [ -d "$1" ]; then
+        __found=${1%/}
+        wrk_src=${__found##*/}
+        sub "wrk_src: $wrk_src"
+        unset __found
+    fi
+}
+
+# packaging section
 
 post_process() {
     if [ "${keep_libtool:-no}" != yes ]; then
         find "$DESTDIR" -name '*.la' -type f -exec rm -f {} + 2>/dev/null || :
     fi
+
     if [ "$BPM_STRIP" = 1 ] && [ "${no_strip:-no}" != yes ] && have strip; then
         sub "stripping"
         find "$DESTDIR" -type f -perm -u+x -exec strip --strip-unneeded {} + 2>/dev/null || :
     fi
 }
 
-# the manifest lists every path the package owns, directories with a trailing
-# slash, reverse sorted so that removal deletes files before their directories
-manifest_create() {
-    ( cd "$DESTDIR" && find . ! -name . | while read -r f; do
-        if [ -d "$f" ] && [ ! -L "$f" ]; then printf '%s/\n' "${f#.}"
-        else printf '%s\n' "${f#.}"; fi
-      done ) | sort -r
-}
-
-# b3sum everything the package contains, this gets generated at build time
-# along with the other package metadata
-# the format is <type><class> <sum> <path>
-#    type f = regular file
-#    type l = symlink
-#    class c = configuration
-#    class - = everything else (bins, libs, whatever)
-#    sum = blake3 of the contents or the target of a symlink
-#
-# class c needs to exist for stuff in /etc which may not match because things were modified
-# /var/db/bpm gets skipped ofc
-sums_create() {
-    have b3sum || have rhash || { warn "no blake3 implementation, skipping sums"; return 0; }
-    _cf=" $(printf '%s ' ${config_files:-})"
-    ( cd "$DESTDIR" && find . ! -name . ! -type d | while read -r f; do
-        _p=${f#.}
-        case $_p in /var/db/bpm/*) continue ;; esac
-        case $_p in
-            /etc/*) _c=c ;;
-            *) case $_cf in *" $_p "*) _c=c ;; *) _c=- ;; esac ;; # little golfing never hurt anyone except for my future self
-        esac
-        if [ -h "$f" ]; then printf 'l%s %s  %s\n' "$_c" "$(readlink "$f")" "$_p"
-        else printf 'f%s %s  %s\n' "$_c" "$(blake3 "$f")" "$_p"; fi
-      done )
-}
-
-write_db() {
-    _d=$DESTDIR/var/db/bpm/installed/$pkg_name
-    mkdir -p "$_d"
-    cp "$tmpl_dir/template" "$_d/template"
-    printf '%s\n' "$pkg_ver" > "$_d/version"
-    printf '%s\n' "$(use_effective)"  > "$_d/use"
-    # one per line, this is a correction for the way depends get listed
-    # in package templates
-    (set -f; for _dd in ${depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/depends"
-    (set -f; for _dd in ${use_depends-}; do printf '%s\n' "$_dd"; done ) > "$_d/use_depends"
-    [ -s "$_d/use_depends" ] || rm -f "$_d/use_depends"
-    (set -f; for _dd in ${register_shell-}; do printf '%s\n' "$_dd"; done ) > "$_d/shells"
-    [ -s "$_d/shells" ] || rm -f "$_d/shells"
-    acct_records > "$_d/accounts"
-    [ -s "$_d/accounts" ] || rm -f "$_d/accounts"
-    sums_create > "$_d/sums"
-    [ -s "$_d/sums" ] || rm -f "$_d/sums"
-
-    manifest_create > "$_d/manifest"
-}
-
-# this folds $DESTDIR dirs that are symlinks in the live root into whatever
-# the point at so packages only ever carry the real dir
-#
-# this fucking mess was spawned by gtar replacing symlinks with real directories
-# when it extracts a directory entry over one
-#
-# this also keeps the manifest accurate as to where it put stuff
+# a directory in $DESTDIR that is a symlink in the real root (/usr/sbin -> bin for example)
+# gets folded into its target so the package only ever has the real directory
+# and its files list doesnt lie about where things actually go
+# this is mostly a fix for gtar replacing symlinks with real dirs when it
+# extracts over one
 dest_fold_symlinks() {
     while :; do
-        _fold=
-        # shortest path first so /usr/sbin folds before anything beneath it
-        for _p in $( cd "$DESTDIR" && find . -mindepth 1 -type d |
-                     sed 's|^\.||' |
-                     awk '{ n = gsub(/\//, "/"); print n, $0 }' |
-                     sort -n -k1,1 | cut -d' ' -f2- ); do
-            if [ -h "$BPM_ROOT$_p" ]; then _fold=$_p; break; fi
+        # shallowest first so /usr/sbin folds before anything in it
+        __fold=
+        __dirs=$(
+            cd "$DESTDIR" && find . -mindepth 1 -type d |
+                awk '{ print gsub("/", "/"), substr($0, 2) }' |
+                sort -n |
+                cut -d' ' -f2-
+        )
+
+        for __dir in $__dirs; do
+            if [ -h "$BPM_ROOT$__dir" ]; then
+                __fold=$__dir
+                break
+            fi
         done
-        [ -n "$_fold" ] || return 0
+        [ -n "$__fold" ] || { unset __fold __dirs __dir __target; return 0; }
 
-        _tgt=$(readlink "$BPM_ROOT$_fold")
-        case $_tgt in
+        __target=$(readlink "$BPM_ROOT$__fold")
+        case $__target in
             /*) ;;
-            *) _tgt=${_fold%/*}/$_tgt ;; # relative to the links own directory
+            *) __target=${__fold%/*}/$__target ;;
         esac
-        [ -d "$BPM_ROOT$_tgt" ] ||
-            die "dest_fold_symlinks: $_fold -> $_tgt is not a directory in the root"
-        case $_tgt in
-            "$_fold"|"$_fold"/*)
-                die "dest_fold_symlinks: $_fold -> $_tgt is circular" ;;
+        [ -d "$BPM_ROOT$__target" ] ||
+            die "dest_fold_symlinks: $__fold -> $__target is not a directory in the root"
+
+        case $__target in
+            "$__fold"|"$__fold"/*) die "dest_fold_symlinks: $__fold -> $__target is circular" ;;
         esac
 
-        sub "folding $_fold into $_tgt"
-        mkdir -p "$DESTDIR$_tgt"
-        # tar is used here instead of mv so nested dirs merge instead of nest
-        # and so dotfiles are not missed + modes like setuid survive
-        ( cd "$DESTDIR$_fold" && tar cf - . ) |
-            ( cd "$DESTDIR$_tgt" && tar xf - ) ||
-            die "dest_fold_symlinks: could not merge $_fold into $_tgt"
-        rm -rf "$DESTDIR$_fold"
+        sub "folding $__fold into $__target"
+        mkdir -p "$DESTDIR$__target"
+
+        # tar instead of mv for this, nested directories merge instead of nesting
+        # dotfiles arent missed and setuid and whatnot survive
+        ( cd "$DESTDIR$__fold" && tar cf - . ) | ( cd "$DESTDIR$__target" && tar xf - ) ||
+            die "dest_fold_symlinks: could not merge $__fold into $__target"
+
+        rm -rf "${DESTDIR:?}$__fold"
     done
 }
 
+# the files list, also look at db.sh
+#
+# names with a tab or a newline can't be recorded, no real package needs this
+# subshelled intentionally
+files_create() (
+    cd "$DESTDIR" || exit 1
+    newline='
+'
+    odd=$(find . -name "*$tab*" -o -name "*$newline*" | head -n1)
+    [ -z "$odd" ] || die "$pkg_name: a packaged path contains a tab or a newline: $odd"
+
+    find . ! -name . -type f ! -path './var/db/bpm/*' > "$BPM_RUN/files.hash"
+    : > "${BPM_RUN}/files.sums"
+    
+    if [ -s "${BPM_RUN}/files.hash" ]; then
+        if hash_have; then
+            blake3_list < "${BPM_RUN}/files.hash" > "${BPM_RUN}/files.sums"
+            [ "$(wc -l < "$BPM_RUN/files.sums")" = "$(wc -l < "$BPM_RUN/files.hash")" ] ||
+                die "$pkg_name: hashing the packaged files has failed"
+        else
+            warn "no blake3 implementation, files recorded without checksums"
+        fi
+    fi
+
+    set -f; set -- ${config_files:-}; set +f
+    configs=" $* "
+
+    # <./path> <type> <value>, then the class goes in and the . comes off
+    { awk 'FILENAME == ARGV[1] { sum[FNR] = $0; next }
+           { print $0 "\tf\t" ((FNR in sum) ? sum[FNR] : "-") }' "$BPM_RUN/files.sums" "$BPM_RUN/files.hash"
+      find . ! -name . -type d | awk '{ print $0 "/\td\t-" }'
+      find . ! -name . ! -type d ! -type l \( ! -type f -o -path './var/db/bpm/*' \) | awk '{ print $0 "\tf\t-" }'
+      find . ! -name . -type l | while IFS= read -r link; do
+          printf '%s\tl\t%s\n' "$link" "$(readlink "$link")"
+      done
+    } | awk -F'\t' -v OFS='\t' -v configs="$configs" '{
+        path = substr($1, 2)
+        class = ($2 != "d" && (path ~ /^\/etc\// || index(configs, " " path " "))) ? "c" : "-"
+        print path, $2, class, $3
+    }' | LC_ALL=C sort -r
+)
+
+# write_lines <file> <words> - one word per line, the file only exists if there are any
+write_lines() {
+    __file=$1; shift
+    set -f; set -- $*; set +f
+    if [ $# -gt 0 ]; then
+        printf '%s\n' "$@" > "$__file"
+    else
+        rm -f "$__file"
+    fi
+    unset __file
+}
+
+write_db() {
+    __db=$DESTDIR/var/db/bpm/installed/$pkg_name
+    mkdir -p "$__db"
+    cp "${tmpl_dir}/template" "${__db}/template"
+    printf '%s\n' "$pkg_ver" > "$__db/version"
+    use_effective > "${__db}/use"
+    write_lines "${__db}/depends" "${depends:-}"; : >> "${__db}/depends"
+    write_lines "$__db/use_depends" "${use_depends:-}"
+    write_lines "$__db/shells" "${register_shell:-}"
+    acct_records > "$__db/accounts"
+    [ -s "${__db}/accounts" ] || rm -f "${__db}/accounts"
+    # last and through a redirect that creates it first so it lists itself
+    files_create > "${__db}/files"
+    unset __db
+}
+
+# the archive and next to it the copy of its db entry (look at ar_meta)
 create_archive() {
-    mkdir -p "${pkg_ar%/*}"
-    ( cd "$DESTDIR" && tar cf - . ) | comp "$pkg_ar" > "$pkg_ar.part"
+    mkdir -p "${pkg_ar%/*}/meta"
+    ( cd "$DESTDIR" && tar cf - . ) | compress "$pkg_ar" > "${pkg_ar}.part"
+    __meta=${pkg_ar%/*}/meta/${pkg_ar##*/}
+    rm -rf "$__meta" "$__meta.part"
+    cp -R "$DESTDIR/var/db/bpm/installed/$pkg_name" "$__meta.part"
     mv -f "$pkg_ar.part" "$pkg_ar"
+    mv -f "$__meta.part" "$__meta"
+    : > "$__meta/.stamp"
+    unset __meta
     msg "built $pkg_ar"
 }
 
+# if you're just now looking over this, this would be a good place to start to contextualize
 build_run() {
     tmpl_load "$1"
     build_env
@@ -214,44 +300,29 @@ build_run() {
 
     rm -rf "$build_dir" "$dest_dir"
     mkdir -p "$build_dir" "$dest_dir"
-    # a private /tmp keeps build system bullshit out of the hosts, but must
-    # not shadow a cache that lives underneath it
-    if [ "$BPM_SANDBOX" = 1 ] && have mount; then
+
+    # private /tmp keeps the build system droppings off of the host
+    # unless the cache itself is there
+    [ "$BPM_SANDBOX" = 1 ] && have mount && {
         case $BPM_CACHE in
             /tmp|/tmp/*) ;;
             *) mount -t tmpfs tmpfs /tmp 2>/dev/null || : ;;
         esac
-    fi
+    }
+    run_dir
 
-    # precedence everywhere: template do_* > style_* > bpms default
-    if have do_extract; then do_extract
-    elif have style_extract; then style_extract
-    else extract; fi
-
-    # archives don't always unpack "cleanly" if they'renamed after a tag or commit
-    # if the expected directory isn't here but the archive created exactly one of its
-    # own, use that instead
-    if [ ! -d "$build_dir/$wrk_src" ]; then
-        _ndir=0
-        for _cand in "$build_dir"/*/; do
-            if [ -d "$_cand" ]; then _ndir=$((_ndir + 1)); _wsrc=$_cand; fi
-        done
-        if [ "$_ndir" = 1 ]; then
-            _wsrc=${_wsrc%/}
-            wrk_src=${_wsrc##*/}
-            sub "wrk_src: $wrk_src"
-        fi
-    fi
-
+    step extract extract
+    find_wrk_src
     cd "$build_dir/$wrk_src" 2>/dev/null || cd "$build_dir"
-    if have do_patch; then do_patch
-    elif have style_patch; then style_patch
-    else apply_patches; fi
-    if [ -n "${build_wrk_src:-}" ]; then mkdir -p "$build_wrk_src"; cd "$build_wrk_src"; fi
+    step patch apply_patches
+    [ -n "${build_wrk_src:-}" ] && {
+        mkdir -p "$build_wrk_src"
+        cd "$build_wrk_src"
+    }
 
     phase configure
     phase build
-    if [ "$BPM_CHECK" = 1 ]; then phase check; fi
+    [ "$BPM_CHECK" = 1 ] && phase check
     phase install
 
     post_process
@@ -260,33 +331,38 @@ build_run() {
     create_archive
 }
 
-# install wrappers for package templates
-# these exist to try to keep templates consistent, idea more or less
-# stolen from void linux
-#
-# everything below writes relative to $DESTDIR and is built from mkdir/cp/chmod
+# install helpers for templates
+# this idea came from void linuxs xbps-src
 
-_bdest() { printf '%s\n' "$DESTDIR/${1#/}"; }
+__dest() { printf '%s\n' "$DESTDIR/${1#/}"; }
 
 # bmkdir [-m mode] <dir>...
 bmkdir() {
-    _m=0755
-    if [ "$1" = -m ]; then _m=$2; shift 2; fi
-    for _d; do
-        _t=$(_bdest "$_d")
-        mkdir -p "$_t"
-        chmod "$_m" "$_t"
+    __mode=0755
+    [ "$1" = -m ] && {
+        __mode=$2
+        shift 2
+    }
+
+    for __d; do
+        __t=$(__dest "$__d")
+        mkdir -p "$__t"
+        chmod "$__mode" "$__t"
     done
+    unset __mode __d __t
 }
 
 # binstall <file> <mode> <targetdir> [newname]
 binstall() {
     [ $# -ge 3 ] || die "usage: binstall <file> <mode> <targetdir> [newname]"
     [ -f "$1" ] || die "binstall: no such file: $1"
-    _t=$(_bdest "$3"); _n=${4:-${1##*/}}
-    mkdir -p "$_t"
-    cp -f "$1" "$_t/$_n"
-    chmod "$2" "$_t/$_n"
+    __t=$(__dest "$3")
+    __n=${4:-${1##*/}}
+
+    mkdir -p "$__t"
+    cp -f "$1" "${__t}/${__n}"
+    chmod "$2" "${__t}/${__n}"
+    unset __t __n
 }
 
 bbin() { binstall "$1" 0755 /usr/bin "${2:-}"; }
@@ -299,64 +375,72 @@ blicense() { binstall "$1" 0644 "/usr/share/licenses/$pkg_name" "${2:-}"; }
 bdoc() { binstall "$1" 0644 "/usr/share/doc/$pkg_name${2:+/$2}"; }
 bdata() { binstall "$1" 0644 "/usr/share/$pkg_name${2:+/$2}"; }
 
-# bman <file> [newname] - section taken from the file extension
+# bman <file> [newname] - the section comes from the extension
 bman() {
-    _n=${2:-${1##*/}}
-    _s=${_n##*.}
-    case $_s in
+    __n=${2:-${1##*/}}
+    __s=${__n##*.}
+
+    case $__s in 
         [0-9]*) ;;
-        *) die "bman: cannot determine man section of $_n" ;;
+        *) die "bman: cannot determine man section of $__n" ;;
     esac
-    binstall "$1" 0644 "/usr/share/man/man${_s%%[!0-9]*}" "$_n"
+
+    binstall "$1" 0644 "/usr/share/man/man${__s%%[!0-9]*}" "$__n"
+    unset __n __s
 }
 
 # bcompletion <file> <bash|zsh|fish> [name]
 bcompletion() {
-    _n=${3:-$pkg_name}
+    __n=${3:-$pkg_name}
     case $2 in
-        bash) binstall "$1" 0644 /usr/share/bash-completion/completions "$_n" ;;
-        zsh) binstall "$1" 0644 /usr/share/zsh/site-functions "_$_n" ;;
-        fish) binstall "$1" 0644 /usr/share/fish/vendor_completions.d "$_n.fish" ;;
+        bash) binstall "$1" 0644 /usr/share/bash-completion/completions "$__n" ;;
+        zsh) binstall "$1" 0644 /usr/share/zsh/site-functions "_$__n" ;;
+        fish) binstall "$1" 0644 /usr/share/fish/vendor_completions.d "$__n.fish" ;;
         *) die "bcompletion: unknown shell: $2" ;;
     esac
+    unset __n
 }
 
 # bcopy <src>... <targetdir> - recursive, globs allowed
 bcopy() {
-    for _t; do :; done
-    _t=$(_bdest "$_t")
-    mkdir -p "$_t"
-    _n=$(($# - 1))
-    for _s; do
-        [ "$_n" -gt 0 ] || break
-        cp -R "$_s" "$_t"
-        _n=$((_n - 1))
+    for __t; do :; done
+    __t=$(__dest "$__t")
+    mkdir -p "$__t"
+    __n=$(($# - 1))
+    for __s; do
+        [ "$__n" -gt 0 ] || break
+        cp -R "$__s" "$__t"
+        __n=$((__n - 1))
     done
+    unset __t __n __s
 }
 
 # bmove <src> <dest> - both inside $DESTDIR
 bmove() {
-    _d=$(_bdest "$2")
-    mkdir -p "${_d%/*}"
-    mv -f "$(_bdest "$1")" "$_d"
+    __d=$(__dest "$2")
+    mkdir -p "${__d%/*}"
+    mv -f "$(__dest "$1")" "$__d"
+    unset __d
 }
 
 # bln <target> <linkname>
 bln() {
-    _l=$(_bdest "$2")
-    mkdir -p "${_l%/*}"
-    ln -sf "$1" "$_l"
+    __l=$(__dest "$2")
+    mkdir -p "${__l%/*}"
+    ln -sf "$1" "$__l"
+    unset __l
 }
 
-# bsed <expression> <file>... - portable in-place edit
+# bsed <expression> <file>... - portable in place edit, keeps owner and mode
 bsed() {
-    _e=$1; shift
-    for _f; do
-        sed "$_e" "$_f" > "$_f.bpmtmp"
-        cat "$_f.bpmtmp" > "$_f"
-        rm -f "$_f.bpmtmp"
+    __e=$1; shift
+    for __f; do
+        sed "$__e" "$__f" > "$__f.bpmtmp"
+        cat "$__f.bpmtmp" > "$__f"
+        rm -f "$__f.bpmtmp"
     done
+    unset __e __f
 }
 
-# brm <path>... - delete inside $DESTDIR (e.g. unwanted docs)
-brm() { for _p; do rm -rf "$(_bdest "$_p")"; done; }
+# brm <path>... - delete inside $DESTDIR (unwanted stuff)
+brm() { for __p; do rm -rf "$(__dest "$__p")"; done; unset __p; }

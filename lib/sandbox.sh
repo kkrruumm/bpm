@@ -1,152 +1,158 @@
-# bpm build root handling
-#
-# everything in here runs inside the namespaces created by sandbox() in bpm(1),
-# which means as uid 0 (mapped from the calling user when unprivileged) with a
-# private mount namespace, so every mount made here is invisible to the host and
-# goes away on its own when the build exits
+# bpm buildroots
+# this runs inside namespaces sandbox() in bpm creates as uid0
+# (the calling user mapped to root when unpriv'd) with its own mount
+# namespace so every mount here is invisible to the host and is removed
+# post build
 #
 # layout under $BPM_BUILDROOT:
-#    base/         shared base system, repopulated only when $BPM_BASEPKGS change
-#    base.stamp    the package set base/ was populated from
-#    <pkg>/root    what the build sees as /
-#    <pkg>/up      overlay upper layer, thrown away after every build
-#    <pkg>/work    overlay work directory
+#   base/         shared base system, only repopulated when BPM_BASEPKGS change
+#   base.stamp    the package set base/ was populated from
+#   <pkg>/root    what the build sees as /
+#   <pkg>/up      overlay upper layer, thrown away after every build
+#   <pkg>/work    overlay work dir
 #
-# only make_depends (plus their runtime closure) are unpacked into the root, so
-# a template that fails to declare something will fail to build instead of
-# silently picking it up off of the host
-
-# unpack a binary package into a root
-# no hooks, no alternatives, no configuration preservation, the root is
-# disposable so none of that applies and the archive carries its own
-# /var/db/bpm entry, which means the root gets a usable package database
+# the orchestrator (../bpm) figures out what archives need to go into the root,
+# nothing here reads a template other than the one being built
+#
+# any undeclared dependencies kills the build instead of quietly getting picked
+# up from the host since builds are done in a sandbox
+#
+# unpack archives into a root, no hooks, alternatives, or config handling
+# since the root is disposable and every archive brings in its own db entry
 broot_unpack() {
-    ( tmpl_load "$2"
-      [ -f "$pkg_ar" ] || die "$2: no binary package at $pkg_ar"
-      sub "unpacking $pkg_name-$pkg_ver"
-      decomp "$pkg_ar" < "$pkg_ar" | tar xf - -C "$1/" )
+    unpack_root=$1; shift
+
+    for archive; do
+        sub "unpacking $(ar_name "$archive")-$(ar_ver "$archive")"
+        untar "$archive" "${unpack_root}/"
+    done
+
+    unset unpack_root archive
 }
 
-# identity of a package set, used to notice that the base is out of date
-broot_stamp() {
-    for _bs in "$@"; do
-        ( tmpl_load "$_bs"
-          printf '%s@%s %s\n' "$pkg_name" "$pkg_ver" "$(use_effective)" )
-    done | sort
-}
-
-# populate the shared base, this is the expensive part and it only happens when
-# one of $BPM_BASEPKGS changed version or use flags
+# broot_base <stamp> <archive>... - (re)populate the base when its package set changed
 broot_base() {
-    _bb=$BPM_BUILDROOT/base
-    # shellcheck disable=SC2086
-    _bw=$(broot_stamp $BPM_BASEPKGS)
-    if [ -d "$_bb" ] &&
-       [ "$_bw" = "$(cat "$BPM_BUILDROOT/base.stamp" 2>/dev/null || :)" ]; then
-        return 0
-    fi
+    base=${BPM_BUILDROOT}/base stamp=$1; shift
+    mkdir -p "$BPM_BUILDROOT"
 
-    msg "populating build root base in $_bb"
-    rm -rf "$_bb" "$BPM_BUILDROOT/base.stamp"
-    mkdir -p "$_bb"
-    # shellcheck disable=SC2086
-    for _bp in $(rdeps_closure $BPM_BASEPKGS); do broot_unpack "$_bb" "$_bp"; done
-    printf '%s\n' "$_bw" > "$BPM_BUILDROOT/base.stamp"
+    [ -d "$base" ] && [ "$stamp" = "$(cat "${BPM_BUILDROOT}/base.stamp" 2>/dev/null)" ] && {
+        unset base stamp
+        return 0
+    }
+
+    msg "populating build root base in $base"
+    rm -rf "$base" "${BPM_BUILDROOT}/base.stamp"
+    mkdir -p "$base"
+    broot_unpack "$base" "$@"
+    printf '%s\n' "$stamp" > "${BPM_BUILDROOT}/base.stamp"
+
+    unset base stamp
 }
 
-# overlayfs is mountable inside a user namespace since 5.11, where its xattrs
-# live in user.* instead of trusted.*, hence userxattr
-# anything older or otherwise unhappy falls back to copying the base,
-# which should work everywhere
+# overlayfs mounts inside a user namespace since linux 5.11 with its
+# xattrs in user.* instead of truted.* (userxattr), anything else
+# will get a copy of the base
 broot_assemble() {
-    _bd=$BPM_BUILDROOT/$1
-    rm -rf "$_bd"
-    mkdir -p "$_bd/root" "$_bd/up" "$_bd/work"
+    layer=${BPM_BUILDROOT}/${1}
+    rm -rf "$layer"
+    mkdir -p "${layer}/root" "${layer}/up" "${layer}/work"
 
-    if [ "$BPM_BROOT_OVERLAY" = 1 ]; then
-        _bo="lowerdir=$BPM_BUILDROOT/base,upperdir=$_bd/up,workdir=$_bd/work"
-        if [ "${BPM_USERNS:-0}" = 1 ]; then _bo="$_bo,userxattr"; fi
-        if mount -t overlay bpm -o "$_bo" "$_bd/root" 2>/dev/null; then
-            printf '%s\n' "$_bd/root"
+    [ "$BPM_BROOT_OVERLAY" = 1 ] && {
+        options="lowerdir=${BPM_BUILDROOT}/base,upperdir=${layer}/up,workdir=${layer}/work"
+        [ "${BPM_USERNS:-0}" = 1 ] && options="${options},userxattr"
+
+        mount -t overlay bpm -o "$options" "${layer}/root" 2>/dev/null && {
+            unset layer options
             return 0
-        fi
-        warn "overlayfs unavailable, falling back to copying the base"
-    fi
+        }
 
-    cp -a "$BPM_BUILDROOT/base/." "$_bd/root/"
-    printf '%s\n' "$_bd/root"
+        warn "overlayfs unavailable, falling back to copying the base"
+    }
+
+    cp -a "${BPM_BUILDROOT}/base/." "${layer}/root/"
+    unset layer options
 }
 
 # broot_bind <ro|rw> <path> - bind <path> into the root at the same path
-#
-# keeping the paths identical is what lets the build stage use $BPM_CACHE,
-# $tmpl_dir and shit unmodified on both sides of the chroot
+# which is what enables the build stage to use $BPM_CACHE, $tmpl_dir, 
+# and the r est without changing them
 broot_bind() {
-    _bt=$_BROOT$2
     [ -e "$2" ] || return 0
+    target=${root}${2}
+
     if [ -d "$2" ]; then
-        mkdir -p "$_bt"
+        mkdir -p "$target"
     else
-        mkdir -p "${_bt%/*}"
-        [ -e "$_bt" ] || : > "$_bt"
+        mkdir -p "${target%/*}"
+        [ -e "$target" ] || : > "$target"
     fi
-    mount --bind "$2" "$_bt" || die "cannot bind $2 into the build root"
-    if [ "$1" = ro ]; then mount -o remount,bind,ro "$_bt" || :; fi
+
+    mount --bind "$2" "$target" || die "cannot bind $2 into the build root"
+    [ "$1" = ro ] && { mount -o remount,bind,ro "$target" || :; }
+
+    unset target
 }
 
-# devices cannot be created in a user namespace, so the handful that builds
-# actually want get bound in from the host instead
+# devices cant be created inside of a user namespace so the handful that
+# builds may need are bound from the host
 broot_dev() {
-    mount -t tmpfs -o mode=0755 tmpfs "$_BROOT/dev"
-    mkdir -p "$_BROOT/dev/pts" "$_BROOT/dev/shm"
-    for _bn in null zero full random urandom tty; do
-        [ -e "/dev/$_bn" ] || continue
-        : > "$_BROOT/dev/$_bn"
-        mount --bind "/dev/$_bn" "$_BROOT/dev/$_bn"
+    dev=${root}/dev
+    mount -t tmpfs -o mode=0755 tmpfs "$dev"
+    mkdir -p "${dev}/pts" "${dev}/shm"
+
+    for node in null zero full random urandom tty; do
+        [ -e "/dev/${node}" ] || continue
+        : > "${dev}/${node}"
+        mount --bind "/dev/${node}" "${dev}/${node}"
     done
-    ln -s /proc/self/fd "$_BROOT/dev/fd"
-    ln -s /proc/self/fd/0 "$_BROOT/dev/stdin"
-    ln -s /proc/self/fd/1 "$_BROOT/dev/stdout"
-    ln -s /proc/self/fd/2 "$_BROOT/dev/stderr"
-    if mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$_BROOT/dev/pts" 2>/dev/null; then
-        ln -s pts/ptmx "$_BROOT/dev/ptmx"
+
+    ln -s /proc/self/fd "${dev}/fd"
+    ln -s /proc/self/fd/0 "${dev}/stdin"
+    ln -s /proc/self/fd/1 "${dev}/stdout"
+    ln -s /proc/self/fd/2 "${dev}/stderr"
+
+    if mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "${dev}/pts" 2>/dev/null; then
+        ln -s pts/ptmx "${dev}/ptmx"
     else
-        : > "$_BROOT/dev/ptmx"
-        mount --bind /dev/ptmx "$_BROOT/dev/ptmx" 2>/dev/null || :
+        : > "${dev}/ptmx"
+        mount --bind /dev/ptmx "${dev}/ptmx" 2>/dev/null || :
     fi
-    mount -t tmpfs -o mode=1777 tmpfs "$_BROOT/dev/shm"
+
+    mount -t tmpfs -o mode=1777 tmpfs "${dev}/shm"
+    unset dev node
 }
 
 broot_mounts() {
-    _BROOT=$1
-    mkdir -p "$_BROOT/proc" "$_BROOT/sys" "$_BROOT/dev" "$_BROOT/tmp" "$_BROOT/run"
-    # the scrubbed environment sets HOME=/root, sadly plenty of build systems
-    # write there whether anyone asked them to or not
-    mkdir -p "$_BROOT/root"
-    chmod 0700 "$_BROOT/root"
+    mkdir -p "${root}/proc" "${root}/sys" "${root}/dev" "${root}/tmp" "${root}/run"
 
-    mount -t proc proc "$_BROOT/proc" || die "cannot mount /proc in the build root"
+    # the scrubbed env has HOME=/root, some build systems
+    # are going to write there anyway
+    mkdir -p "${root}/root"
+    chmod 0700 "${root}/root"
+
+    mount -t proc proc "${root}/proc" || die "cannot mount /proc in the build root"
     broot_dev
-    mount -t tmpfs -o mode=1777 tmpfs "$_BROOT/tmp"
-    mount -t tmpfs -o mode=0755 tmpfs "$_BROOT/run"
-    # a few build systems poke at sysfs, it is read only and non fatal
-    mount --bind /sys "$_BROOT/sys" 2>/dev/null &&
-        { mount -o remount,bind,ro "$_BROOT/sys" 2>/dev/null || :; } || :
+    mount -t tmpfs -o mode=1777 tmpfs "${root}/tmp"
+    mount -t tmpfs -o mode=0755 tmpfs "${root}/run"
 
-    # the build writes its staged tree and its finished archive straight onto
-    # host storage, so nothing has to be copied back out afterwards
-    broot_bind rw "$BPM_CACHE/build"
-    broot_bind rw "$BPM_CACHE/dest"
-    broot_bind rw "$BPM_CACHE/bin"
-    broot_bind ro "$BPM_CACHE/sources"
+    # a few build systems poke at sysfs, read only and not fatal
+    mount --bind /sys "${root}/sys" 2>/dev/null && {
+        mount -o remount,bind,ro "${root}/sys" 2>/dev/null || :
+    }
 
-    # bpm itself, its library and the templates, none of which are packages
+    # the build writes its tree and finished archive straight to host storage
+    broot_bind rw "${BPM_CACHE}/build"
+    broot_bind rw "${BPM_CACHE}/dest"
+    broot_bind rw "${BPM_CACHE}/bin"
+    broot_bind ro "${BPM_CACHE}/sources"
+
+    # bpm, its library and the templates, none of which are packages,
+    # and the config so use flags resolve the same on both sides
     broot_bind ro "$BPM_SELF"
     broot_bind ro "$BPM_LIBDIR"
-    for _br in $BPM_REPOS; do broot_bind ro "$_br"; done
-
-    # use flag resolution has to come out the same inside as it did outside,
-    # which means the configuration has to be readable in here too
+    for repo in $BPM_REPOS; do
+        broot_bind ro "$repo"
+    done
     broot_bind ro "$BPM_CONF"
     broot_bind ro "$BPM_USECONF"
     broot_bind ro "$BPM_REPOCONF"
@@ -154,61 +160,45 @@ broot_mounts() {
     if [ "${allow_network:-no}" = yes ]; then
         broot_bind ro /etc/resolv.conf
     elif have ip; then
-        # test suites that bind to 127.0.0.1 need loopback up in the new netns
+        # test suites binding 127.0.0.1 need loopback in the new netns
         ip link set lo up 2>/dev/null || :
     fi
+
+    unset repo
 }
 
-# make_depends of <pkg> plus everything those need at runtime, this is the
-# entire contents of the build root on top of the base
-broot_deps() {
-    # shellcheck disable=SC2046
-    rdeps_closure $(tmpl_get "$1" make_depends)
-}
-
-# the build root is hermetic on the filesystem, this makes it hermetic on the
-# environment too, anything the caller happened to have exported, CPPFLAGS,
-# LD_LIBRARY_PATH, PKG_CONFIG_PATH and whatnot would otherwise reach the build
-# and quietly change its result
-#
-# what survives would be the BPM_ variables the build stage needs, the compiler flags,
-# a fixed PATH and identity, and whatever BPM_ENV_KEEP names
-
-# entry point, called by 'bpm __stage' from inside the namespaces
+# broot_run <pkg> <archive>... - assemble the root and then chroot into stage
+# two with a scrubbed env, whatever the callr exported (CPPFLAGS for example)
+# would otherwise get to the build quietly
 broot_run() {
-    tmpl_load "$1"
-    [ -n "$BPM_BASEPKGS" ] ||
-        die "BPM_BUILDROOT is set but BPM_BASEPKGS is empty, nothing to build in"
+    tmpl_load "$1"; shift
+    [ -d "${BPM_BUILDROOT}/base" ] || die "the build root base has not been populated"
+    broot_assemble "$pkg_name"
+    root=${BPM_BUILDROOT}/${pkg_name}/root
+    broot_unpack "$root" "$@"
+    broot_mounts
 
-    mkdir -p "$BPM_BUILDROOT"
-    broot_base
-    _bR=$(broot_assemble "$pkg_name")
-    # shellcheck disable=SC2046
-    for _bp in $(broot_deps "$1"); do broot_unpack "$_bR" "$_bp"; done
-    broot_mounts "$_bR"
+    # resolved now since env -i is about to drop PATH
+    chroot=$(command -v chroot) || die "chroot(1) not found"
+    env=$(command -v env 2>/dev/null) || env=
+    [ -z "$env" ] && {
+        warn "env(1) not found, the build inherits the caller's environment"
+        exec "$chroot" "$root" "$BPM_SELF" __build "$pkg_name"
+    }
 
-    # resolved here because env -i is about to bomb PATH 
-    _bC=$(command -v chroot) || die "chroot(1) not found"
-    _bE=$(command -v env 2>/dev/null) || _bE=
-
-    if [ -z "$_bE" ]; then
-        warn "env(1) not found, the build inherits the callers environment"
-        exec "$_bC" "$_bR" "$BPM_SELF" __build "$pkg_name"
-    fi
-
-    # from here on the positional parameters are the scrubbed environment,
-    # everything still needed below is a global that tmpl_load set
-    set -- "$_bE" -i \
-        "PATH=$BPM_BROOT_PATH" HOME=/root USER=root LOGNAME=root \
+    # every exported BPM_ variable is let through, the compiler flags
+    # a fixed PATH and identity, and whatever BPM_ENV_KEEP specifies
+    #
+    # the names come from env(1) and the values from the shell so values with
+    # whitespace survive
+    set -- "$env" -i "PATH=$BPM_BROOT_PATH" HOME=/root USER=root LOGNAME=root \
         "TERM=${TERM:-dumb}" SHELL=/bin/sh
 
-    # names come from env(1)values from the shell, so values containing
-    # whitespace or anything else exciting survive
-    for _bv in $(env | sed -n 's/^\(BPM_[A-Za-z0-9_]*\)=.*/\1/p') \
-               CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS GOFLAGS GOAMD64 CGO_ENABLED ZIGFLAGS ${BPM_ENV_KEEP:-}; do
-        eval "[ -n \"\${$_bv+x}\" ]" || continue
-        eval "set -- \"\$@\" \"$_bv=\${$_bv}\""
+    for var in $(env | sed -n 's/^\(BPM_[A-Za-z0-9_]*\)=.*/\1/p') \
+               CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS GOFLAGS GOAMD64 CGO_ENABLED ${BPM_ENV_KEEP:-}; do
+        eval "[ -n \"\${$var+set}\" ]" || continue
+        eval "set -- \"\$@\" \"$var=\${$var}\""
     done
 
-    exec "$@" "$_bC" "$_bR" "$BPM_SELF" __build "$pkg_name"
+    exec "$@" "$chroot" "$root" "$BPM_SELF" __build "$pkg_name"
 }

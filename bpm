@@ -2,31 +2,41 @@
 #
 # bpm - basix package manager
 #
+# this toplevel "bpm" script is an orchestrator,
+# most functionality is located in the lib/ scripts
 set -eu
 
 BPM_PROGVER=0.10
 
-# where the fuck am i so we can re-exec into the sandbox and into root
+# the absolute path to bpm, this is needed so bpm can re-exec itself
+# in the sandbox and into root if needed
 case $0 in
-    */*) _dir=$(cd "${0%/*}" && pwd); BPM_SELF=$_dir/${0##*/} ;;
-    *) BPM_SELF=$(command -v "$0"); _dir=${BPM_SELF%/*} ;;
+    */*) self_dir=$(cd "${0%/*}" && pwd); BPM_SELF=$self_dir/${0##*/} ;;
+    *) BPM_SELF=$(command -v "$0"); self_dir=${BPM_SELF%/*} ;;
 esac
-if [ -d "$_dir/lib/style" ]; then : "${BPM_LIBDIR:=$_dir/lib}"; fi
+
+[ -d "$self_dir/lib/style" ] && {
+    : "${BPM_LIBDIR:=$self_dir/lib}"
+}
 : "${BPM_LIBDIR:=/usr/lib/bpm}"
 : "${BPM_CONF:=/etc/bpm/bpm.conf}"
 
-# BPM_LIBDIR has to come from the environment because the library is needed here,
-# which is way before bpm.conf is read
-if [ ! -f "$BPM_LIBDIR/common.sh" ]; then
-    printf 'bpm: no library found at %s\n' "$BPM_LIBDIR" >&2
-    printf 'bpm: set BPM_LIBDIR in the environment (bpm.conf is read too late)\n' >&2
+# the core library is required before bpm.conf gets read so BPM_LIBDIR can only come
+# from the environment
+[ ! -f "$BPM_LIBDIR/core.sh" ] && {
+    printf 'bpm: could not find core library at %s\n' "$BPM_LIBDIR" >&2
+    printf 'bpm: set BPM_LIBDIR in the environment\n' >&2
     exit 1
-fi
+}
 
-. "$BPM_LIBDIR/common.sh"
-. "$BPM_LIBDIR/pkg.sh"
-. "$BPM_LIBDIR/account.sh"
+# essential library loading happens here instead of lazily
+for lib in core.sh template.sh db.sh fetch.sh ; do
+    . "${BPM_LIBDIR}/${lib}"
+done
+unset lib
+
 config_load
+
 trap 'interrupted 130' INT
 trap 'interrupted 143' TERM
 trap 'interrupted 129' HUP
@@ -61,8 +71,9 @@ usage: bpm <command> [argument ...]
                       was installed
   [f]iles    pkg      list files owned by an installed package
   [o]wns     path     show which package owns a path
-  [c]hecksum [-w] pkg print blake3 sums of the dist_files (-w rewrites template)
+  [c]hecksum pkg      print the checksum= line for a template's dist_files
   [d]ownload pkg...   fetch dist_files only
+  log        [pkg]    list build logs, or show one
   clean [all]         remove build trees and staged destdirs, "all" also
                       removes the build root base
   [h]elp, [v]ersion
@@ -74,712 +85,757 @@ EOF
     exit "${1:-1}"
 }
 
-# builds run in fresh mount, pid, ipc, uts and (unless the template enables
-# network access) network namespaces via unshare
-#
-# unprivileged users also get a user namespace, uid 0 inside is the caller outside
-# so the build can chown to root and write its dest_dir while every file owned by
-# the real root maps to an unmapped uid and stays unwritable
-#
-# with BPM_BUILDROOT set what lands in here is __stage, which uses the mount
-# namespace to assemble a root of its own and chroots into it, without it the
-# build runs against the hosts / which is IMO unclean
-
+# build sandboxing
 sandbox() {
-    if [ "$BPM_SANDBOX" = 0 ]; then
-        _sb_st=0
-        "$@" || _sb_st=$?
-        return "$_sb_st"
-    fi
+    [ "$BPM_SANDBOX" = 0 ] && { "$@" ; return ; }
+
+    # TODO: bwrap at some point? might be pointless honestly
     have unshare || die "unshare(1) not found; install util-linux/busybox or set BPM_SANDBOX=0"
 
-    _u="--mount --pid --fork --ipc --uts --mount-proc"
+    set -- --mount --pid --fork --ipc --uts --mount-proc -- "$@"
     BPM_USERNS=0
-    if [ "$(id -u)" != 0 ]; then
-        _u="$_u --user --map-root-user"
+    [ "$BPM_UID" != 0 ] && {
+        set -- --user --map-root-user "$@"
         BPM_USERNS=1
-    fi
-    if [ "${allow_network:-no}" != yes ]; then _u="$_u --net"; fi
+    }
+
+    # some bullshit languages require either this or vendoring (rust for example)
+    [ "${allow_network:-no}" != yes ] && { set -- --net "$@" ; }
+
     export BPM_USERNS
-
-    unshare $_u -- "$@"
+    unshare "$@"
 }
 
-# build shit
+# resolving
+#
+# resolve <pkg>... works out what a build or install of <pkg> means
+# before anything actually happens and gives:
+#   install_order  runtime deps first, ending in what specifically got requested
+#   build_plan  name|pkg_ver|role per package to build in build order
+#     the build loop will run exactly this list
 
-# a build root is populated from binary packages, so everything that goes into
-# one has to exist as a binary package first, which shouldn't be an issue because
-# in theory the system bpm is run against was built off of a basix tarball with the
-# base system already built, so missing a base package is a hard error
-broot_base_missing() {
-    # shellcheck disable=SC2086
-    for _bm in $(rdeps_closure $BPM_BASEPKGS); do
-        ar_current "$_bm" || printf ' %s' "$_bm"
-    done
+# bpm needs to refuse to do anything other than update itself if it's out of date
+# unless it's been pinned by the user
+bpm_outdated() {
+    pkg_installed bpm && ! pkg_pinned bpm || return 1
+    index_add bpm
+
+    # bpm_new stays set, self_check reports it; the test is the return value
+    bpm_new=$(index_get bpm ver)
+    [ "$bpm_new" != '?' ] && [ "$(pkg_version bpm)" != "$bpm_new" ]
 }
 
-broot_require_base() {
-    [ -n "$BPM_BASEPKGS" ] ||
-        die "BPM_BUILDROOT is set but BPM_BASEPKGS is empty, nothing to build in"
-    _miss=$(broot_base_missing)
-    [ -z "$_miss" ] || die "no current binary package for build root base:$_miss
-    these have to be built against the host once, e.g.:
-        BPM_BUILDROOT= bpm build$_miss"
-}
-
-# build whatever the build root for <pkg> will need and does not have yet
-broot_prebuild() {
-    case " ${BPM_BUILDING:-} " in
-        *" $1 "*) die "$1: dependency cycle in make_depends" ;;
+# 'bootstrapping gcc' would return 0
+# 'bootstrapping gc' would return 1, no partial matching
+bootstrapping() {
+    case " ${BPM_BOOTSTRAP:-} " in
+        *" $1 "*)
+            return 0
+        ;;
     esac
-    BPM_BUILDING="${BPM_BUILDING:-} $1"
 
-    broot_require_base
-    # populating the base needs uid 0 as much as the build does, but it is
-    # shared, so it happens once per run and outside of any packages build log
-    if [ "${BPM_BASE_READY:-0}" = 0 ]; then
-        sandbox "$BPM_SELF" __base || die "failed to populate the build root base"
-        BPM_BASE_READY=1
-    fi
-
-    # shellcheck disable=SC2046
-    for _bd in $(rdeps_closure $(tmpl_get "$1" make_depends)); do
-        ar_current "$_bd" || build_one "$_bd"
-    done
-
-    BPM_BUILDING=${BPM_BUILDING%" $1"}
+    return 1
 }
 
-# if theres not a defined buildroot the build will be running on the hosts /
-# so the makedepends *have* to be installed on the host but
-# require interaction for this so this isnt a hidden installation of
-# build only dependencies
-host_require_makedeps() {
-    _miss=
-    # shellcheck disable=SC2046
-    for _hd in $(rdeps_closure $(tmpl_get "$1" make_depends)); do
-        pkg_installed "$_hd" || _miss="$_miss $_hd"
+# if a user is doing a fresh basix install the buildroot base packages havent been built
+# so the packages to form that base need to be built raw against the host
+self_check() {
+    bpm_outdated || { unset bpm_new; return 0; }
+    index_table
+    self_set=" $(graph "$BPM_RUN/table" closure bpm) "
+
+    for pkg; do
+        case $self_set in
+            *" $pkg "*)
+                continue
+            ;;
+        esac
+        die "bpm is outdated ($(pkg_version bpm) -> $bpm_new), update it first with:
+        bpm update"
     done
-    [ -z "$_miss" ] || die "$1: BPM_BUILDROOT is unset and makedepends are missing:$_miss
-    set BPM_BUILDROOT in $BPM_CONF so they can be built into a throwaway root
-    or put them on the host intentionally with:
-        bpm install$_miss"
+    unset pkg
+
+    [ -n "$BPM_BUILDROOT" ] && [ -n "$BPM_BASEPKGS" ] && {
+        base_missing=$(graph "$BPM_RUN/table" unmet "$BPM_BASEPKGS" c)
+        [ -n "$base_missing" ] && {
+            BPM_BOOTSTRAP=$self_set
+            warn "the buildroot base hasn't been built yet, building bpm's update against the host"
+        }
+        unset base_missing
+    }
+
+    unset self_set bpm_new
 }
 
-plan_check() {
-    _pc_base=0
-    for _pc; do
-        if [ -n "$BPM_BUILDROOT" ] && ! bootstrapping "$_pc"; then
-            [ "$_pc_base" = 1 ] || broot_require_base
-            _pc_base=1
-        else
-            host_require_makedeps "$_pc"
-        fi
+resolve() {
+    named=$*
+    index_add "$@" ${BPM_BUILDROOT:+$BPM_BASEPKGS}
+    self_check "$@"
+    index_table
+    table=$BPM_RUN/table
+
+    install_order=$(graph "$table" order "$named")
+    graph "$table" usedeps "$install_order" "$BPM_USECONF"
+    build_plan=$(graph "$table" plan "$install_order" "$named")
+    plan_names=$(printf '%s\n' "$build_plan" | cut -d'|' -f1)
+
+    # raw host builds need make_depends to be on the host and installing them
+    # is the users call
+    host_missing=$(graph "$table" hostdeps "$plan_names")
+    [ -n "$host_missing" ] && {
+        first=$(printf '%s\n' "$host_missing" | head -n1)
+        pkg=${first%%|*}
+        missing=${first#*|}
+
+        die "$pkg: BPM_BUILDROOT is unset and makedepends are missing: $missing
+    set BPM_BUILDROOT or put them on the host directly with:
+        bpm install $missing"
+    }
+    unset host_missing first missing
+
+    # the buildroot is populated from binary packages from the host
+    # so those binary packages have to exist first, on a basix system
+    # these should already be there
+    needs_base=0
+    [ -n "$BPM_BUILDROOT" ] && {
+        for pkg in $plan_names; do
+            bootstrapping "$pkg" || needs_base=1
+        done
+        unset pkg
+    }
+
+    [ "$needs_base" = 1 ] && {
+        [ -n "$BPM_BASEPKGS" ] || die "BPM_BUILDROOT is set but BPM_BASEPKGS is empty, nothing to build in"
+        
+        base_missing=$(graph "$table" unmet "$BPM_BASEPKGS" c)
+        [ -z "$base_missing" ] || die "no current binary package for build root base: $base_missing
+    these have to be built against the host once, e.g.:
+        BPM_BUILDROOT= bpm build $base_missing"
+        unset base_missing
+    }
+
+    # install_order, build_plan, plan_names, named and table are the results,
+    # unset by whoever consumes them (cmd_build, cmd_install)
+    unset needs_base
+}
+
+show_builds() {
+    [ -z "$build_plan" ] && { msg "nothing to build"; return 0; }
+
+    msg "$(words "$plan_names") package(s) to build:"
+    printf '%s\n' "$build_plan" | while IFS='|' read -r name ver role; do
+        sub "$name $ver${role:+ ($role)}"
     done
+}
+
+show_installs() {
+    msg "$(words "$install_order") package(s) to install:"
+    graph "$table" versions "$install_order" | while IFS='|' read -r name ver use; do
+        pkg_installed "$name" && {
+            old=$(pkg_version "$name")
+            if [ "$old" = "$ver" ]; then
+                ver="$ver (reinstall)"
+            else
+                ver="$old -> $ver"
+            fi
+        }
+        case " $named " in
+            *" $name "*) ;;
+            *) ver="$ver (dependency)" ;;
+        esac
+        sub "$name $ver"
+    done
+}
+
+# archive paths for a list of indexed packages
+archives_of() {
+    [ -n "$1" ] || return 0
+    graph "$table" versions "$1" | while IFS='|' read -r name ver use; do
+        ar_path "$name" "$ver"
+    done
+}
+
+# build stuff
+#
+# the buildroot base is shared so its populated once per run and outside any pakages log
+base_ready=0
+base_populate() {
+    [ "$base_ready" = 0 ] || return 0
+    base_set=$(graph "$table" closure "$BPM_BASEPKGS")
+    stamp=$(graph "$table" versions "$base_set" | awk -F'|' '{ print $1 "@" $2 " " $3 }' | sort)
+    sandbox "$BPM_SELF" __base "$stamp" $(archives_of "$base_set") ||
+        die "failed to populate the build root base"
+
+    unset stamp base_set
+    base_ready=1
 }
 
 build_one() {
-    if [ "$BPM_FORCE" = 0 ] && ar_current "$1"; then
-        tmpl_load "$1"
-        sub "$pkg_name-$pkg_ver is already built"
-        return 0
-    fi
-    
-    # look at self_check too, BPM_BUILDROOT is exported so emptying it here
-    # sends the __stage to the host too
-    if [ -n "$BPM_BUILDROOT" ] && bootstrapping "$1"; then
-        _bo_br=$BPM_BUILDROOT
-        BPM_BUILDROOT=
-        build_one "$1"
-        BPM_BUILDROOT=$_bo_br
-        return 0
-    fi
-
-    if [ -n "$BPM_BUILDROOT" ]; then
-        broot_prebuild "$1"
+    if [ -n "$BPM_BUILDROOT" ] && ! bootstrapping "$1"; then
+        base_populate
+        deps=$(graph "$table" closure "$(index_get "$1" make_depends)")
+        set -- "$1" root $(archives_of "$deps")
     else
-        host_require_makedeps "$1"
+        set -- "$1" host
     fi
 
-    tmpl_load "$1"
-    # the archive records the flags it was built with, so a use flag
-    # change invalidates it just like a version bump does
-    if [ -f "$pkg_ar" ] && [ "$BPM_FORCE" = 0 ]; then
+    log=$BPM_LOGDIR/$1.log
+    status=0
+
+    ( tmpl_load "$1"
+    [ -f "$pkg_ar" ] && [ "$BPM_FORCE" = 0 ] && {
         sub "$pkg_name: use flags changed to \"$(use_effective)\", rebuilding"
-    fi
-    # sources were fetched by prefetch outside the sandbox since it probably
-    # has no network
-    src_verify
+    }
 
-    msg "building $pkg_name-$pkg_ver [$build_style] use: $(use_effective)"
-    _log=$BPM_LOGDIR/$pkg_name.log
-    _st=0
-    run_logged "$pkg_name-$pkg_ver" "$_log" sandbox "$BPM_SELF" __stage "$pkg_name" || _st=$?
+    msg "building ${pkg_name}-${pkg_ver} [${build_style}] use: $(use_effective)"
+    run_logged "$pkg_name-$pkg_ver" "$log" sandbox "$BPM_SELF" __stage "$@" ) || status=$?
 
-    # the mounts died with the namespace, this is only the overlay upper layer
-    if [ -n "$BPM_BUILDROOT" ] && [ "$BPM_BROOT_KEEP" = 0 ]; then
-        rm -rf "${BPM_BUILDROOT:?}/$pkg_name"
-    fi
-    [ "$_st" = 0 ] || die "$pkg_name: build failed, full log in $_log"
+    [ "$2" = root ] && [ "$BPM_BROOT_KEEP" = 0 ] && rm -rf "${BPM_BUILDROOT:?}/$1"
+    [ "$status" = 0 ] || die "$1: build failed, full log in $log"
+    unset log status deps
 }
 
-# bpm should be up to date before anything else happens as a bit of a safety net
-# unless bpm is pinned, only bpm itself is allowed to install/update while its out of date
-bpm_outdated() {
-    pkg_installed bpm && pkg_find bpm >/dev/null || return 1
-    pkg_pinned bpm && return 1
-    _sv=$(tmpl_get bpm pkg_ver)
-    [ "$(cat "$BPM_DB/bpm/version")" != "${_sv% }" ]
-}
-
-# on a fresh install from a basix tarball the buildroot hasnt been built yet
-# so while the base is missing whatever bpm needs to update *itself* is built
-# against the host
-self_check() {
-    bpm_outdated || return 0
-    _sc=" $(rdeps_closure bpm) "
-    for _p; do
-        case $_sc in *" $_p "*) ;; *) die "bpm is out of date ($(cat "$BPM_DB/bpm/version") -> ${_sv% }), update it first with:
-        bpm update" ;; esac
+build_all() {
+    # shellcheck disable=SC2086
+    prefetch $plan_names
+    for pkg in $plan_names; do
+        build_one "$pkg"
     done
-    if [ -n "$BPM_BUILDROOT" ] && [ -n "$BPM_BASEPKGS" ] &&
-       [ -n "$(broot_base_missing)" ]; then
-        BPM_BOOTSTRAP=$_sc
-        warn "the build root base isn't built yet, building bpm's update against the host"
-    fi
 }
+
+# commands below this point
 
 cmd_build() {
     [ $# -gt 0 ] || usage
-    self_check "$@"
-    _order=$(deps_order "$@")
-    for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
-    _plan=$(build_plan $_order) || exit 1
-    # shellcheck disable=SC2086
-    plan_check $_plan
-    # shellcheck disable=SC2086
-    show_builds "$*" "$_order" $_plan
-    # shellcheck disable=SC2086
-    prefetch $_plan
-    for _p in $_order; do build_one "$_p"; done
+    builder_dirs_check
+    resolve "$@"
+    show_builds
+    build_all
+    unset install_order build_plan plan_names named table
+    # pretty straight forward huh
 }
 
 cmd_install() {
-    _yes=0
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -y|--yes) _yes=1 ;;
-            --) shift; break ;;
-            -*) die "unknown option: $1 (try 'bpm help')" ;;
-            *) break ;;
-        esac
-        shift
-    done
+    opts "y=yes" "$@"
+    shift "$opt_shift"
+    yes=$opt_y
     [ $# -gt 0 ] || usage
-    self_check "$@"
-    # deps order wont install a package that's already installed
-    # so ez hack is to just treat a pinned package like its already installed
-    for _p; do
-        if pkg_pinned "$_p"; then
-            die "$_p is pinned at $(cat "$BPM_DB/$_p/version")
+
+    for pkg; do
+        pkg_pinned "$pkg" && {
+            die "$pkg is pinned at $(pkg_version "$pkg")
     release it first with:
-        bpm unpin $_p"
-        fi
+        bpm unpin $pkg"
+        }
     done
-    _order=$(deps_order "$@")
-    for _p in $_order; do usedep_check "$_p" $(tmpl_get "$_p" use_depends); done
-    _plan=$(build_plan $_order) || exit 1
-    # shellcheck disable=SC2086
-    plan_check $_plan
-    # shellcheck disable=SC2086
-    show_builds "$*" "$_order" $_plan
-    # shellcheck disable=SC2086
-    show_installs "$*" $_order
+    unset pkg
 
-    if [ "$_yes" = 0 ] && ! confirm "proceed?" "proceed"; then
+    builder_dirs_check
+    resolve "$@"
+    show_builds
+    show_installs
+
+    [ "$yes" = 0 ] && ! confirm "proceed?" "proceed" && {
         msg "nothing installed"
+        unset yes install_order build_plan plan_names named table
         return 0
-    fi
+    }
+    unset yes
 
-    # shellcheck disable=SC2086
-    prefetch $_plan
-    for _p in $_order; do build_one "$_p"; done
+    build_all
 
-    # what the user entered is explicit, whatever deps_order appended isnt
-    # so removing the one thing that *was* wanted makes the rest collectable
-    # BPM_MARK is so updates don't fuck with install reasons
-    _named=" $* "
-    _args= _last=
-    for _p in $_order; do
-        tmpl_load "$_p"
-        pkg_save_old "$_p"
-        case $_named in
-            *" $_p "*) _m=${BPM_MARK:-explicit} ;;
-            *) _m=auto ;;
+    # what the user requested is explicit, dependencies those explicit packages pull aren't
+    # so removing the one thing that was explicitly requested makes the rest collectable
+    # BPM_MARK=keep is how updates leave install reasons alone
+    graph "$table" versions "$install_order" > "${BPM_RUN}/install"
+    set --
+    last_mark=
+    while IFS='|' read -r pkg ver use; do
+        case " $named " in
+            *" $pkg "*)
+                mark=${BPM_MARK:-explicit}
+            ;;
+            *)
+                mark=auto # oh hi mark
+            ;;
         esac
-        if [ "$_m" != "$_last" ]; then _args="$_args --$_m"; _last=$_m; fi
-        _args="$_args $pkg_ar"
-    done
-    # shellcheck disable=SC2086
-    as_root "$BPM_SELF" __install $_args
+        
+        [ "$mark" != "$last_mark" ] && {
+            set -- "$@" "--${mark}"
+            last_mark=$mark
+        }
+
+        archive=$(ar_path "$pkg" "$ver")
+        # root reads the db entry next to the archive, make sure its actually there
+        ar_meta "$archive" || die "$pkg: $archive has no database entry"
+        set -- "$@" "$archive"
+    done < "${BPM_RUN}/install"
+    unset last_mark mark archive pkg ver use install_order build_plan plan_names named table
+
+    as_root "$BPM_SELF" __install "$@"
 }
 
 cmd_remove() {
-    _sweep=$BPM_AUTOREMOVE _force=0
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -a|--autoremove) _sweep=1 ;;
-            -A|--no-autoremove) _sweep=0 ;;
-            -f|--force) _force=1 ;;
-            --) shift; break ;;
-            -*) die "unknown option: $1 (try 'bpm help')" ;;
-            *) break ;;
-        esac
-        shift
-    done
+    opts "a=autoremove A=no-autoremove f=force" "$@"
+    shift "$opt_shift"
+    sweep=$BPM_AUTOREMOVE
+    [ "$opt_a" = 1 ] && sweep=1
+    [ "$opt_A" = 1 ] && sweep=0
     [ $# -gt 0 ] || usage
-    for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+    require_installed "$@"
 
-    # packages left behind that depend on something that's about to get thanos snapped
-    # anything else in the same removal doesnt count
-    if [ "$_force" = 0 ]; then
-        BPM_OMIT=$*
-        _held=
-        for _p; do
-            for _r in $(pkg_rdeps "$_p"); do _held="$_held $_r->$_p"; done
-        done
-        BPM_OMIT=
-        [ -z "$_held" ] || die "these would be left with missing dependencies:$_held
-    remove them too, or pass -f to do it anyway"
-    fi
+    [ "$opt_f" = 0 ] && {
+        db_table
+        held=$(graph "${BPM_RUN}/db" held "$*")
+        [ -z "$held" ] || die "these would be left with missing dependencies: $held
+    remove them too or pass -f to do it anyway"
+    }
 
-    # the sweep gets put into the same removal instead of running after it so there's
-    # only one escalation and pass over the disk
-    _rm=$*
-    if [ "$_sweep" = 1 ]; then
-        _orph=$(pkg_orphans "$@" | tr '\n' ' ')
-        if [ -n "$_orph" ]; then
-            msg "also removing orphaned: $_orph"
-            _rm="$_rm $_orph"
-        fi
-    fi
+    # the sweep is part of the same removal instead of running after it
+    # so there's only one escalation and one pass over the disk
+    removing=$*
+    [ "$sweep" = 1 ] && {
+        orphans=$(pkg_orphans "$@" | tr '\n' ' ')
+        [ -n "$orphans" ] && msg "also removing orphaned: $orphans" && removing="$removing $orphans"
+    }
 
     # shellcheck disable=SC2086
-    _rm=$(remove_order $_rm)
+    removing=$(remove_order $removing)
     # shellcheck disable=SC2086
-    as_root "$BPM_SELF" __remove $_rm
+    as_root "$BPM_SELF" __remove $removing
 
-    if [ "$_sweep" = 0 ]; then
-        _orph=$(pkg_orphans | tr '\n' ' ')
-        if [ -n "$_orph" ]; then
-            _n=0
-            for _p in $_orph; do _n=$((_n + 1)); done
-            warn "$_n package(s) are now orphaned, remove them with 'bpm autoremove'"
-        fi
-    fi
+    [ "$sweep" = 0 ] && {
+        orphans=$(pkg_orphans)
+        [ -z "$orphans" ] || warn "$(words "$orphans") package(s) are now orphaned, remove them with 'bpm autoremove'"
+    }
+    unset sweep held removing orphans
 }
 
 cmd_autoremove() {
-    _dry=0 _yes=0
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -n|--dry-run) _dry=1 ;;
-            -y|--yes) _yes=1 ;;
-            --) shift; break ;;
-            -*) die "unknown option: $1 (try 'bpm help')" ;;
-            *) break ;;
-        esac
-        shift
-    done
-    [ $# -eq 0 ] || die "autoremove takes no package arguments (try 'bpm help')"
-
-    _orph=$(pkg_orphans | tr '\n' ' ')
-    if [ -z "$_orph" ]; then msg "no orphaned packages"; return 0; fi
-
-    # shellcheck disable=SC2086
-    _orph=$(remove_order $_orph)
-    _n=0
-    for _p in $_orph; do _n=$((_n + 1)); done
-    msg "$_n orphaned package(s):"
-    for _p in $_orph; do sub "$_p $(cat "$BPM_DB/$_p/version")"; done
-    [ "$_dry" = 0 ] || return 0
-
-    # the remove list bpm decides on isn't explicitly entered by the user
-    # so this requires confirmation from the user unless -y
-    if [ "$_yes" = 0 ] && ! confirm "remove these?" "remove these"; then
-        msg "nothing removed"
+    opts "n=dry-run y=yes" "$@"
+    shift "$opt_shift"
+    [ $# -eq 0 ] || die "autoremove takes no package arguments (look at 'bpm help')"
+    orphans=$(pkg_orphans)
+    [ -z "$orphans" ] && {
+        msg "no orphaned packages"
         return 0
-    fi
+    }
 
     # shellcheck disable=SC2086
-    as_root "$BPM_SELF" __remove $_orph
-}
+    orphans=$(remove_order $orphans)
+    msg "$(words "$orphans") orphaned package(s):"
+    for pkg in $orphans; do
+        sub "$pkg $(pkg_version "$pkg")"
+    done
+    unset pkg
+    [ "$opt_n" = 0 ] || { unset orphans; return 0; }
 
-# repository shit
+    # bpm chose these instead of the user so just make sure
+    [ "$opt_y" = 0 ] && ! confirm "remove these?" "remove these" && { msg "nothing removed" ; unset orphans ; return 0 ; }
+
+    # shellcheck disable=SC2086
+    as_root "$BPM_SELF" __remove $orphans
+    unset orphans
+}
 
 cmd_pull() {
     [ -r "$BPM_REPOCONF" ] || die "no repository list at $BPM_REPOCONF"
+    as_root "$BPM_SELF" __pull
+}
+
+cmd__pull() {
     while read -r name url branch; do
-        case $name in ''|\#*) continue ;; esac
+        case $name in ''|\#*) continue;; esac
         case $url in /*) continue ;; esac
-        _d=$BPM_REPODIR/$name
-        if [ -d "$_d/.git" ]; then
+
+        dir=${BPM_REPODIR}/${name}
+        if [ -d "${dir}/.git" ]; then
             msg "pulling $name"
-            git -C "$_d" pull -q --ff-only
+            # checkout chowned to a user as a workaround for unpriv'd
+            # pulls would be dubious ownership otherwise
+            git -c safe.directory="$dir" -C "$dir" pull -q --ff-only
         else
             msg "cloning $name from $url"
-            mkdir -p "${_d%/*}"
-            git clone -q ${branch:+--branch "$branch"} "$url" "$_d"
+            mkdir -p "${dir%/*}"
+            git clone -q ${branch:+--branch "$branch"} "$url" "$dir"
         fi
     done < "$BPM_REPOCONF"
+    unset name url branch dir
 }
 
 cmd_update() {
-    _uyes=
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -y|--yes) _uyes=-y ;;
-            --) shift; break ;;
-            -*) die "unknown option: $1 (try 'bpm help')" ;;
-            *) break ;;
-        esac
-        shift
-    done
-    [ $# -eq 0 ] || die "update takes no package arguments (try 'bpm help')"
+    opts "y=yes" "$@"
+    shift "$opt_shift"
+    # not "yes": cmd_install unsets that, and the self-update path needs this
+    # again after cmd_install has run
+    yes_arg=; [ "$opt_y" = 1 ] && yes_arg=-y
+    [ $# -eq 0 ] || die "update takes no package arguments (look at 'bpm help')"
     cmd_pull
-    _out= _held=
-    for _d in "$BPM_DB"/*/; do
-        [ -f "$_d/version" ] || continue
-        _p=${_d%/}; _p=${_p##*/}
-        if ! pkg_find "$_p" >/dev/null; then
-            warn "$_p: no longer in any repository"
-            continue
-        fi
-        if [ -f "$_d/use_depends" ]; then usedep_check "$_p" $(cat "$_d/use_depends"); fi
-        _oldv=$(cat "$_d/version")
-        _oldu=$(cat "$_d/use" 2>/dev/null || echo)
-        tmpl_load "$_p"
-        if [ "$_oldv" != "$pkg_ver" ] || [ "$_oldu" != "$(use_effective)" ]; then
-            if pkg_pinned "$_p"; then
-                _held="$_held $_p"
-                continue
-            fi
-            _out="$_out $_p"
-        fi
+
+    installed=$(pkg_all)
+    # shellcheck disable=SC2086
+    index_add $installed
+    index_table
+    graph "${BPM_RUN}/table" usedeps "$installed" "$BPM_USECONF"
+    unset installed
+    db_table
+
+    # installed vs what the templates would build right now
+    # three lines, packages that arent in a repo anymore, pinned ones held, and the rest
+    awk -F'|' '
+        FILENAME == ARGV[1] { ver[$1] = $2; use[$1] = $3; next }
+        ver[$1] == "?"     { gone = gone " " $1; next }
+        $2 != ver[$1] || $3 != use[$1] {
+            if (index($8, "p")) held = held " " $1; else outdated = outdated " " $1
+        }
+        END { print gone; print held; print outdated }
+    ' "$BPM_RUN/index" "$BPM_RUN/db" > "$BPM_RUN/changes"
+    { read -r gone; read -r held; read -r outdated; } < "${BPM_RUN}/changes"
+
+    for pkg in $gone; do
+        warn "$pkg: no longer in any repository"
     done
-    [ -z "$_held" ] || msg "pinned, not updating:$_held"
-    if [ -z "$_out" ]; then
-        if [ -n "$_held" ]; then msg "nothing else to update"
-        else msg "everything is up to date"; fi
+
+    [ -z "$held" ] || msg "pinned, not updating: $held"
+    [ -z "$outdated" ] && {
+        if [ -n "$held" ]; then
+            msg "nothing else to update"
+        else
+            msg "everything is up to date"
+        fi
+        unset pkg gone held outdated yes_arg
         return 0
-    fi
-    msg "to update:$_out"
-    # an update isnt a request for any of these, a package that got pulled as a dep
-    # stays a dep after it's rebuilt
+    }
+    unset gone held
+
+    msg "to update: $outdated"
+
+    # any packages that came through as dependencies need to stay marked as dependencies
     BPM_MARK=keep
 
-    # self_check would finger wag at the whole set so bpm and what it needs goes first
-    # the rest is for the new bpm
-    if bpm_outdated; then
-        _sc=" $(rdeps_closure bpm) " _self= _rest=
-        for _p in $_out; do
-            case $_sc in *" $_p "*) _self="$_self $_p" ;; *) _rest="$_rest $_p" ;; esac
+    # bpm and what it depends on go first and then the rest is done by the new bpm
+    bpm_outdated && {
+        self_set=" $(graph "${BPM_RUN}/table" closure bpm) " self= rest=
+        for pkg in $outdated; do
+            case $self_set in
+                *" $pkg "*)
+                    self="$self $pkg"
+                ;;
+                *)
+                    rest="$rest $pkg"
+                ;;
+            esac
         done
-        if [ -n "$_rest" ]; then
+        unset self_set pkg
+
+        [ -n "$rest" ] && {
             msg "bpm is out of date, updating it before anything else"
             # shellcheck disable=SC2086
-            cmd_install $_uyes $_self
-            BPM_MARK=explicit
-            # still outdated means the prompt was declined
-            if bpm_outdated; then return 0; fi
+            cmd_install $yes_arg $self
+            # still outdated means the user said no
+            bpm_outdated && return 0
             msg "continuing the update with the new bpm"
-            # shellcheck disable=SC2086
-            exec "$BPM_SELF" update $_uyes
-        fi
-    fi
+            rm -rf "$BPM_RUN"
+            exec "$BPM_SELF" update $yes_arg
+        }
+    }
 
     # shellcheck disable=SC2086
-    cmd_install $_uyes $_out
-    BPM_MARK=explicit
+    cmd_install $yes_arg $outdated
+    unset yes_arg outdated self rest pkg
 }
 
 cmd_pin() {
-    if [ $# -eq 0 ]; then
-        _any=0
-        for _p in $(pkg_pins); do
-            _any=1
-            printf '%s %s\n' "$_p" "$(cat "$BPM_DB/$_p/version")"
-        done
-        [ "$_any" = 1 ] || msg "nothing is pinned"
+    [ $# -eq 0 ] && {
+        pins=$(for pkg in $(pkg_all); do if pkg_pinned "$pkg"; then printf '%s\n' "$pkg $(pkg_version "$pkg")"; fi; done)
+        if [ -n "$pins" ]; then
+            printf '%s\n' "$pins"
+        else
+            msg "nothing is pinned"
+        fi
+        unset pins pkg
+
         return 0
-    fi
-    for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+    }
+
+    require_installed "$@"
     as_root "$BPM_SELF" __pin "$@"
 }
 
 cmd_unpin() {
     [ $# -gt 0 ] || usage
-    for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
+    require_installed "$@"
     as_root "$BPM_SELF" __unpin "$@"
 }
 
-# query shit
-
-cmd_search() {
+cmd_search () {
     [ $# -gt 0 ] || usage
-    for _r in $BPM_REPOS; do
-        for _t in "$_r"/*/template "$_r"/*/*/template "$_r"/*/*/*/template; do
-            [ -f "$_t" ] || continue
-            _n=${_t%/template}; _n=${_n##*/}
+    for repo in $BPM_REPOS; do
+        for template in "$repo"/*/template "$repo"/*/*/template "$repo"/*/*/*/template; do
+            [ -f "$template" ] || continue
+            name=${template%/template}; name=${name##*/}
             # shellcheck disable=SC2254
-            case $_n in $1|*$1*) printf '%s\t%s\n' "$_n" "$_r" ;; esac
+            case $name in
+                $1|*$1*)
+                    printf '%s\t%s\n' "$name" "$repo"
+                ;;
+            esac
         done
     done
+    unset repo template name
 }
 
+# i'm so sorry
+# this is more legible than it used to be though
 cmd_query() {
     [ $# -gt 0 ] || usage
-    tmpl_load "$1"
-    # wrap to $COLUMNS (or 80) on a terminal, one line per field when piped
-    _qw=0
-    if [ -t 1 ]; then
-        _qw=${COLUMNS:-80}
-        case $_qw in ''|0|*[!0-9]*) _qw=80 ;; esac
-    fi
-    # templates usually put depends/use_flags on several lines and
-    # use_if leaves gaps so this splits the value into words and then
-    # outputs them again with indentations under the first value
-    _qf() {
-        _ql=$(printf '%-11s' "$1"); _qn=11
-        set -f; set -- $2; set +f
-        for _qv; do
-            if [ "$_qw" -gt 0 ] && [ "$_qn" -gt 11 ] &&
-               [ $((_qn + 1 + ${#_qv})) -gt "$_qw" ]; then
-                printf '%s\n' "$_ql"; _ql='           '; _qn=11
-            fi
-            _ql="$_ql $_qv"; _qn=$((_qn + 1 + ${#_qv}))
-        done
-        printf '%s\n' "$_ql"
+    # checked out here: inside the pipeline below a die would leave awk's status
+    pkg_find "$1" > /dev/null || die "package '$1' not found in any repository"
+    width=0
+    [ -t 1 ] && {
+        case ${COLUMNS:-} in
+            ''|0|*[!0-9]*)
+                width=80
+            ;;
+            *)
+                width=$COLUMNS
+            ;;
+        esac
     }
-    _qf pkg_name "$pkg_name"
-    _qf version "$version"
-    _qf revision "$revision"
-    _qf build_style "$build_style"
-    _qf short_desc "${short_desc:-}"
-    _qf home_page "${home_page:-}"
-    _qf license "${license:-}"
-    _qf depends "${depends:-}"
-    _qf makedepends "${make_depends:-}"
-    _qf use_depends "${use_depends:-}"
-    _qf use_flags "${use_flags:-}"
-    _qf use "$(use_effective)"
-    if [ -n "${system_accounts:-}${system_groups:-}" ]; then
-        _qf accounts "${system_accounts:-}"
-        _qf groups "${system_groups:-}"
-    fi
-    [ -z "${register_shell:-}" ] || _qf shells "$register_shell"
-    _qf template "$tmpl_dir/template"
-    if pkg_installed "$1"; then
-        if pkg_pinned "$1"; then _pin=', pinned'; else _pin=; fi
-        _qf installed "$(cat "$BPM_DB/$1/version") ($(pkg_reason "$1")$_pin)"
-        _rd=$(pkg_rdeps "$1" | tr '\n' ' ')
-        _qf 'required by' "${_rd:-nothing}"
-    fi
+
+    field() { field_name=$1; set -f; set -- $2; set +f; printf '%s\t%s\n' "$field_name" "$*"; }
+
+    ( tmpl_load "$1"
+      field pkg_name "$pkg_name"
+      field version "$version"
+      field revision "$revision"
+      field build_style "$build_style"
+      field short_desc "${short_desc:-}"
+      field home_page "${home_page:-}"
+      field license "${license:-}"
+      field depends "${depends:-}"
+      field make_depends "${make_depends:-}"
+      field use_depends "${use_depends:-}"
+      field use_flags "${use_flags:-}"
+      field use "$(use_effective)"
+      [ -n "${system_accounts:-}${system_groups:-}" ] && {
+            field accounts "${system_accounts:-}"
+            field groups "${system_groups:-}"
+      }
+      [ -z "${register_shell:-}" ] || field shells "$register_shell"
+      field template "$tmpl_dir/template"
+      if pkg_installed "$1"; then
+          pin=; if pkg_pinned "$1"; then pin=', pinned'; fi
+          field installed "$(pkg_version "$1") ($(pkg_reason "$1")$pin)"
+          required_by=$(pkg_rdeps "$1")
+          field 'required by' "${required_by:-nothing}"
+      fi ) |
+    awk -F'\t' -v width="$width" '{
+        line = sprintf("%-11s", $1); len = 11
+        n = split($2, word, " ")
+        for (i = 1; i <= n; i++) {
+            if (width > 0 && len > 11 && len + 1 + length(word[i]) > width) {
+                print line; line = sprintf("%11s", ""); len = 11
+            }
+            line = line " " word[i]; len += 1 + length(word[i])
+        }
+        print line
+    }'
+    unset width field_name
+    unset -f field
 }
 
 cmd_list() {
-    _lr=0
-    if [ "${1:-}" = -r ]; then _lr=1; shift; fi
-    if [ "$_lr" = 1 ]; then
-        # shellcheck disable=SC2046
-        [ $# -gt 0 ] || set -- $(pkg_all)
-        for _p; do
-            pkg_installed "$_p" || die "$_p is not installed"
-            printf '%s %s %s\n' "$_p" "$(cat "$BPM_DB/$_p/version")" "$(pkg_reason "$_p")"
-        done
-        return 0
-    fi
-    if [ $# -gt 0 ]; then
-        for _p; do
-            pkg_installed "$_p" || die "$_p is not installed"
-            printf '%s %s\n' "$_p" "$(cat "$BPM_DB/$_p/version")"
-        done
-        return 0
-    fi
-    for _d in "$BPM_DB"/*/; do
-        [ -f "$_d/version" ] || continue
-        _p=${_d%/}
-        printf '%s %s\n' "${_p##*/}" "$(cat "$_d/version")"
+    opts "r=reason" "$@"
+    shift "$opt_shift"
+    [ $# -eq 0 ] && set -- $(pkg_all)
+    require_installed "$@"
+
+    for pkg; do
+        if [ "$opt_r" = 1 ]; then
+            printf '%s\n' "$pkg $(pkg_version "$pkg") $(pkg_reason "$pkg")"
+        else
+            printf '%s\n' "$pkg $(pkg_version "$pkg")"
+        fi
     done
+    unset pkg
 }
 
 cmd_alternatives() {
-    if [ $# -eq 0 ]; then pkg_list_alternatives; return 0; fi
+    [ $# -eq 0 ] && { pkg_list_alternatives; return 0;}
     [ $# -eq 2 ] || die "usage: bpm alternatives [<pkg> <path>]"
+
     as_root "$BPM_SELF" __swap "$1" "$2"
 }
 
-# pretty much same usage style as alternatives
-# in theory this should be a good way to restore
-# broken/corrupted shit from packages if they still
-# exist in the package archive, this is not useful for
-# detecting tampering or anything though (nongoal)
 cmd_verify() {
-    _ow=0
-    BPM_VERIFY_CONFIG=0
-    BPM_VERIFY_NOSUMS=0
-    while [ $# -gt 0 ]; do
-        case $1 in
-            -c|--config) BPM_VERIFY_CONFIG=1 ;;
-            -o|--overwrite) _ow=1 ;;
-            --) shift; break ;;
-            -*) die "unknown option: $1 (try 'bpm help')" ;;
-            *) break ;;
-        esac
-        shift
-    done
-
-    if [ "$_ow" = 1 ]; then
+    opts "c=config o=overwrite" "$@"
+    shift "$opt_shift"
+    [ "$opt_o" = 1 ] && {
         [ $# -eq 2 ] || die "usage: bpm verify --overwrite <pkg> <path>"
         as_root "$BPM_SELF" __restore "$1" "$2"
         return 0
-    fi
+    }
 
-    if [ $# -eq 0 ]; then
-        for _d in "$BPM_DB"/*/; do
-            [ -f "$_d/version" ] || continue
-            _d=${_d%/}
-            set -- "$@" "${_d##*/}"
-        done
-    else
-        for _p; do pkg_installed "$_p" || die "$_p is not installed"; done
-    fi
+    . "${BPM_LIBDIR}/install.sh"
+    BPM_VERIFY_CONFIG=$opt_c verify_unsummed=0
+    [ $# -eq 0 ] && set -- $(pkg_all)
+    require_installed "$@"
+    status=0
 
-    _st=0
-    for _p; do pkg_verify "$_p" || _st=1; done
-    if [ "$BPM_VERIFY_NOSUMS" -gt 0 ]; then
-        warn "$BPM_VERIFY_NOSUMS package(s) lack checksums and cannot be verified."
-    fi
-    if [ "$_st" = 0 ]; then msg "no mismatches"; fi
-    return "$_st"
+    for pkg; do
+        pkg_verify "$pkg" || status=1
+    done
+    unset pkg
+
+    [ "$verify_unsummed" = 0 ] || warn "$verify_unsummed package(s) lack checksums and cannot be verified"
+    [ "$status" = 1 ] || msg "no mismatches"
+
+    return "$status"
 }
 
 cmd_files() {
     [ $# -gt 0 ] || usage
-    pkg_installed "$1" || die "$1 is not installed"
-    sort "$BPM_DB/$1/manifest"
+    require_installed "$1"
+    cut -f1 "${BPM_DB}/$1/files" | sort
 }
 
 cmd_owns() {
     [ $# -gt 0 ] || usage
     case $1 in
-        /*) _f=$1 ;;
-        *)  _f=$(cd "$(dirname "$1")" && pwd)/$(basename "$1") ;;
+        /*) path=$1 ;;
+        *) path=$(cd "$(dirname "$1")" && pwd)/${1##*/} ;;
     esac
-    _o=$(pkg_owner "$_f")
-    [ -n "$_o" ] || die "no package owns $_f"
-    printf '%s\n' "$_o"
+
+    owner=$(pkg_owner "$path")
+    [ -n "$owner" ] || die "no package owns $path"
+    printf '%s\n' "$owner"
+    unset path owner
 }
 
 cmd_checksum() {
-    _w=0
-    if [ "${1:-}" = -w ]; then _w=1; shift; fi
     [ $# -gt 0 ] || usage
+    builder_dirs_check
     tmpl_load "$1"
     src_fetch
-    _sums=
-    for _d in ${dist_files:-}; do
-        case $_d in git+*) _sums="$_sums SKIP"; continue ;; esac
-        _sums="$_sums $(blake3 "$src_dir/$(dist_name "$_d")")"
+    sums=
+    for dist in ${dist_files:-}; do
+        case $dist in
+            git+*)
+                sums="$sums SKIP"
+                continue
+            ;;
+        esac
+
+        sums="$sums $(blake3 "${src_dir}/$(dist_name "$dist")")"
     done
-    _sums=${_sums# }
-    if [ "$_w" = 1 ]; then
-        sed "s|^checksum=.*|checksum=\"$_sums\"|" "$tmpl_dir/template" > "$tmpl_dir/template.new"
-        mv -f "$tmpl_dir/template.new" "$tmpl_dir/template"
-        msg "checksum updated in $tmpl_dir/template"
-    else
-        printf 'checksum="%s"\n' "$_sums"
-    fi
+    printf 'checksum="%s"\n' "${sums# }"
+    unset sums dist
 }
 
 cmd_download() {
     [ $# -gt 0 ] || usage
-    for _p; do pkg_need "$_p"; done
+    builder_dirs_check
+
+    for pkg; do
+        pkg_find "$pkg" > /dev/null || die "package '$pkg' not found in any repository"
+    done
+    unset pkg
+
     prefetch "$@"
 }
 
 cmd_log() {
-    if [ $# -eq 0 ]; then
-        for _f in "$BPM_LOGDIR"/*.log; do
-            [ -f "$_f" ] || die "no build logs in $BPM_LOGDIR"
-            _n=${_f##*/}
-            printf '%s\n' "${_n%.log}"
+    [ $# -eq 0 ] && {
+        set -- "$BPM_LOGDIR"/*.log
+        [ -f "$1" ] || die "no build logs in $BPM_LOGDIR"
+
+        for log; do
+            log=${log##*/}
+            printf '%s\n' "${log%.log}"
         done
+        unset log
+
         return 0
+    }
+
+    log=$BPM_LOGDIR/$1.log
+    [ -f "$log" ] || die "no build log for $1 at $log"
+
+    if [ -t 1 ] && [ -n "${PAGER:-}" ]; then
+        "$PAGER" "$log"
+    else
+        cat "$log"
     fi
-    _f=$BPM_LOGDIR/$1.log
-    [ -f "$_f" ] || die "no build log for $1 (looked at $_f)"
-    if [ -t 1 ] && [ -n "${PAGER:-}" ]; then "$PAGER" "$_f"; else cat "$_f"; fi
+    unset log
 }
 
 cmd_clean() {
     msg "cleaning build trees"
     rm -rf "${BPM_CACHE:?}/build" "${BPM_CACHE:?}/dest" "${BPM_CACHE:?}/tmp"
-    if [ -n "$BPM_BUILDROOT" ]; then
-        if [ "${1:-}" = all ]; then
-            msg "removing the build root base"
-            rm -rf "${BPM_BUILDROOT:?}"
-        else
-            for _c in "$BPM_BUILDROOT"/*/; do
-                case ${_c%/} in */base) continue ;; esac
-                [ -d "$_c" ] && rm -rf "$_c" || :
-            done
-        fi
-    fi
+    [ -n "$BPM_BUILDROOT" ] || return 0
+
+    [ "${1:-}" = all ] && {
+        msg "removing the build root base"
+        rm -rf "${BPM_BUILDROOT:?}"
+        return 0
+    }
+
+    for layer in "$BPM_BUILDROOT"/*/; do
+        case ${layer%/} in
+            */base) continue ;;
+        esac
+        [ -d "$layer" ] && rm -rf "$layer"
+    done
+    unset layer
 }
 
-# populate the shared build root base, run inside the namespaces so that the
-# unpacked files get the ownership they are supposed to have
+# internal commands
+
 cmd__base() {
-    . "$BPM_LIBDIR/sandbox.sh"
-    mkdir -p "$BPM_BUILDROOT"
-    broot_base
+    . "${BPM_LIBDIR}/sandbox.sh"
+    broot_base "$@"
 }
 
-# stage one: inside the namespaces, still on the hosts /
-#
-# assembles the build root and chroots into it, or gets out of the way when
-# build roots are switched off
+# stage one: inside the namespace, still on the hosts /
+# this assembles the build root and chroots into it or goes straight
+# to stage two if its a raw build
 cmd__stage() {
-    if [ -z "$BPM_BUILDROOT" ]; then cmd__build "$1"; return "$?"; fi
-    . "$BPM_LIBDIR/sandbox.sh"
-    broot_run "$1"
+    pkg=$1 where=$2
+    shift 2
+
+    [ "$where" = host ] && { unset where; cmd__build "$pkg"; return; }
+    unset where
+
+    . "${BPM_LIBDIR}/sandbox.sh"
+    broot_run "$pkg" "$@"
 }
 
-# stage two: inside the build root
 cmd__build() {
-    . "$BPM_LIBDIR/build.sh"
+    . "${BPM_LIBDIR}/build.sh"
     build_run "$1"
 }
 
-# all of the flags here apply to every package that follows them so
-# just 1 escalation can install what was requested and what came with it
-# and still tell them apart
 cmd__install() {
-    _mode=explicit
-    for _a; do
-        case $_a in
-            --explicit|--auto|--keep) _mode=${_a#--}; continue ;;
+    . "${BPM_LIBDIR}/install.sh"
+    mark=explicit
+    for arg; do
+        case $arg in
+            --explicit|--auto|--keep) mark=${arg#--}; continue
+            ;;
         esac
-        pkg_install "$_a"
-        pkg_mark_installed "$(ar_name "$_a")" "$_mode"
+
+        pkg_install "$arg"
+        pkg_mark_installed "$(ar_name "$arg")" "$mark"
     done
+    unset mark arg
 }
-cmd__remove() { for _p; do pkg_remove "$_p"; done; }
-cmd__pin() { for _p; do pkg_pin "$_p"; done; }
-cmd__unpin() { for _p; do pkg_unpin "$_p"; done; }
-cmd__swap() { pkg_swap "$1" "$2"; }
-cmd__restore() { pkg_restore "$1" "$2"; }
+
+cmd__remove() { . "$BPM_LIBDIR/install.sh"; for pkg; do pkg_remove "$pkg"; done; unset pkg; }
+cmd__swap() { . "$BPM_LIBDIR/install.sh"; pkg_swap "$1" "$2"; }
+cmd__restore() { . "$BPM_LIBDIR/install.sh"; pkg_restore "$1" "$2"; }
+cmd__pin() { for pkg; do pkg_pin "$pkg"; done; unset pkg; }
+cmd__unpin() { for pkg; do pkg_unpin "$pkg"; done; unset pkg; }
 
 while [ $# -gt 0 ]; do
     case $1 in
@@ -787,7 +843,7 @@ while [ $# -gt 0 ]; do
         -q|--quiet) BPM_VERBOSE=0 ;;
         --help|--version) break ;;
         --) shift; break ;;
-        -*) die "unknown option: $1 (try 'bpm help')" ;;
+        -*) die "unknown option: $1 (look at 'bpm help')" ;;
         *) break ;;
     esac
     shift
@@ -795,8 +851,10 @@ done
 export BPM_VERBOSE
 
 [ $# -gt 0 ] || usage
-cmd=$1
-shift
+cmd=$1; shift
+# internal commands make their own scratch space when they need it, the sandbox
+# stage execs into chroot and would leave it behind
+case $cmd in __*) ;; *) run_dir ;; esac
 
 case $cmd in
     b|build) cmd_build "$@" ;;
@@ -820,14 +878,7 @@ case $cmd in
     clean) cmd_clean "$@" ;;
     v|version|--version) printf 'bpm %s\n' "$BPM_PROGVER" ;;
     h|help|--help) usage 0 ;;
-    __base) cmd__base "$@" ;;
-    __stage) cmd__stage "$@" ;;
-    __build) cmd__build "$@" ;;
-    __install) cmd__install "$@" ;;
-    __remove) cmd__remove "$@" ;;
-    __pin) cmd__pin "$@" ;;
-    __unpin) cmd__unpin "$@" ;;
-    __swap) cmd__swap "$@" ;;
-    __restore) cmd__restore "$@" ;;
+    __base|__stage|__build|__install|__remove|__pin|__unpin|__swap|__restore|__pull)
+        "cmd_${cmd#_}" "$@" ;; # __stage -> cmd__stage
     *) die "unknown command: $cmd (try 'bpm help')" ;;
 esac
