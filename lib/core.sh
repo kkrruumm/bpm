@@ -402,7 +402,11 @@ hash_have() { have b3sum || have rhash; }
 
 blake3() {
     if have b3sum; then
-        b3sum "$1" | cut -d' ' -f1
+        # through a variable rather than a pipe so b3sums status sticks
+        b3_line=$(b3sum "$1") || { unset b3_line; return 1; }
+        b3_line=${b3_line#\\}
+        printf '%s\n' "${b3_line%% *}"
+        unset b3_line
     elif have rhash; then
         rhash --blake3 --printf='%{blake3}' "$1"
     else
@@ -411,10 +415,9 @@ blake3() {
 }
 
 # newline separated paths on stdin -> one hash per line in the same order
-# names never pass through b3sums output which escapes some of them
 blake3_list() {
     if have b3sum; then
-        tr '\n' '\0' | xargs -0 b3sum --no-names
+        tr '\n' '\0' | xargs -0 b3sum | sed 's/^\\//; s/ .*//'
     else
         tr '\n' '\0' | xargs -0 rhash --blake3 --printf='%{blake3}\n'
     fi
