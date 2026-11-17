@@ -6,7 +6,7 @@
 # most functionality is located in the lib/ scripts
 set -eu
 
-BPM_PROGVER=0.10
+BPM_PROGVER=0.11
 
 # the absolute path to bpm, this is needed so bpm can re-exec itself
 # in the sandbox and into root if needed
@@ -62,7 +62,9 @@ usage: bpm <command> [argument ...]
   [p]ull              clone or pull repositories only
   [s]earch   pattern  search repositories (globs allowed)
   [q]uery    pkg      show template metadata and resolved use flags
-  [a]lternatives      list alternatives, or bpm a <pkg> <path> to swap
+  [a]lternatives      list alternatives, bpm a <pkg> [<path|pattern>...] to swap,
+                      every alternative <pkg> has when no path is given,
+                      -y skips the prompt
   verify     [pkg...] list files that no longer match what was packaged,
                       -c includes config files, --overwrite <pkg> <path>
                       restores the specified file from the archive
@@ -662,10 +664,32 @@ cmd_list() {
 }
 
 cmd_alternatives() {
+    opts "y=yes" "$@"
+    shift "$opt_shift"
     [ $# -eq 0 ] && { pkg_list_alternatives; return 0;}
-    [ $# -eq 2 ] || die "usage: bpm alternatives [<pkg> <path>]"
+    pkg=$1; shift
+    require_installed "$pkg"
 
-    as_root "$BPM_SELF" __swap "$1" "$2"
+    run_dir
+    alt_select "$pkg" "$@" > "${BPM_RUN}/swap.list"
+    [ -s "${BPM_RUN}/swap.list" ] || die "${pkg}: no alternatives matching ${*:-anything}"
+
+    msg "$(wc -l < "${BPM_RUN}/swap.list") path(s) to swap in from ${pkg}:"
+    while IFS= read -r path; do
+        sub "$path"
+    done < "${BPM_RUN}/swap.list"
+
+    [ "$opt_y" = 0 ] && ! confirm "swap these?" "swap these" && {
+        msg "nothing swapped"; unset pkg path; return 0
+    }
+
+    # exact paths from here on so the root side doesnt glob
+    set -- "$pkg"
+    while IFS= read -r path; do
+        set -- "$@" "$path"
+    done < "${BPM_RUN}/swap.list"
+    unset pkg path
+    as_root "$BPM_SELF" __swap "$@"
 }
 
 cmd_verify() {
@@ -832,7 +856,12 @@ cmd__install() {
 }
 
 cmd__remove() { . "$BPM_LIBDIR/install.sh"; for pkg; do pkg_remove "$pkg"; done; unset pkg; }
-cmd__swap() { . "$BPM_LIBDIR/install.sh"; pkg_swap "$1" "$2"; }
+cmd__swap() {
+    . "$BPM_LIBDIR/install.sh"
+    swap_pkg=$1; shift
+    for swap_path; do pkg_swap "$swap_pkg" "$swap_path"; done
+    unset swap_pkg swap_path
+}
 cmd__restore() { . "$BPM_LIBDIR/install.sh"; pkg_restore "$1" "$2"; }
 cmd__pin() { for pkg; do pkg_pin "$pkg"; done; unset pkg; }
 cmd__unpin() { for pkg; do pkg_unpin "$pkg"; done; unset pkg; }

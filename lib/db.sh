@@ -165,6 +165,24 @@ pkg_list_alternatives() (
     done
 )
 
+# alt_select <pkg> [<path|pattern>...]
+#
+# the alternatives <pkg> has that match one of the arguments or
+# all of them with no arguments, patterns are shell globs
+# that get matched against the path
+alt_select() (
+    pkg=$1; shift
+    pkg_list_alternatives | while read -r owner path; do
+        [ "$owner" = "$pkg" ] || continue
+        [ $# -eq 0 ] && { printf '%s\n' "$path"; continue; }
+        for want; do
+            case $path in
+                $want) printf '%s\n' "$path"; break ;;
+            esac
+        done
+    done
+)
+
 # files lists
 #
 # flist <mode> <list> [path]
